@@ -20,6 +20,7 @@ enum class Event {
   EncryptedExtensions,
   CertificateRequest,
   Certificate,
+  CompressedCertificate,
   CertificateVerify,
   Finished,
   NewSessionTicket,
@@ -32,6 +33,7 @@ enum class Event {
   AppWrite,
   AppClose,
   WriteNewSessionTicket,
+  CloseNotify,
   NUM_EVENTS
 };
 

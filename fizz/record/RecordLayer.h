@@ -15,6 +15,12 @@
 
 namespace fizz {
 
+struct TLSContent {
+  Buf data;
+  ContentType contentType;
+  EncryptionLevel encryptionLevel;
+};
+
 class ReadRecordLayer {
  public:
   virtual ~ReadRecordLayer() = default;
@@ -37,9 +43,15 @@ class ReadRecordLayer {
    */
   virtual bool hasUnparsedHandshakeData() const;
 
- private:
+  /**
+   * Returns the current encryption level of the data that the read record layer
+   * can process.
+   */
+  virtual EncryptionLevel getEncryptionLevel() const = 0;
+
   static folly::Optional<Param> decodeHandshakeMessage(folly::IOBufQueue& buf);
 
+ private:
   folly::IOBufQueue unparsedHandshakeData_{
       folly::IOBufQueue::cacheChainLength()};
 };
@@ -48,18 +60,18 @@ class WriteRecordLayer {
  public:
   virtual ~WriteRecordLayer() = default;
 
-  virtual Buf write(TLSMessage&& msg) const = 0;
+  virtual TLSContent write(TLSMessage&& msg) const = 0;
 
-  Buf writeAlert(Alert&& alert) const {
+  TLSContent writeAlert(Alert&& alert) const {
     return write(TLSMessage{ContentType::alert, encode(std::move(alert))});
   }
 
-  Buf writeAppData(std::unique_ptr<folly::IOBuf>&& appData) const {
+  TLSContent writeAppData(std::unique_ptr<folly::IOBuf>&& appData) const {
     return write(TLSMessage{ContentType::application_data, std::move(appData)});
   }
 
   template <typename... Args>
-  Buf writeHandshake(Buf&& encodedHandshakeMsg, Args&&... args) const {
+  TLSContent writeHandshake(Buf&& encodedHandshakeMsg, Args&&... args) const {
     TLSMessage msg{ContentType::handshake, std::move(encodedHandshakeMsg)};
     addMessage(msg.fragment, std::forward<Args>(args)...);
     return write(std::move(msg));
@@ -67,25 +79,20 @@ class WriteRecordLayer {
 
   void setProtocolVersion(ProtocolVersion version) const {
     auto realVersion = getRealDraftVersion(version);
-    if (realVersion == ProtocolVersion::tls_1_3_21 ||
-        realVersion == ProtocolVersion::tls_1_3_20) {
-      recordVersion_ = ProtocolVersion::tls_1_0;
-    } else {
-      recordVersion_ = ProtocolVersion::tls_1_2;
-    }
-
-    if (realVersion == ProtocolVersion::tls_1_3_23 ||
-        realVersion == ProtocolVersion::tls_1_3_22 ||
-        realVersion == ProtocolVersion::tls_1_3_21 ||
-        realVersion == ProtocolVersion::tls_1_3_20) {
+    if (realVersion == ProtocolVersion::tls_1_3_23) {
       useAdditionalData_ = false;
     } else {
       useAdditionalData_ = true;
     }
   }
 
+  /**
+   * Returns the current encryption level of the data that the write record
+   * layer writes at.
+   */
+  virtual EncryptionLevel getEncryptionLevel() const = 0;
+
  protected:
-  mutable ProtocolVersion recordVersion_{ProtocolVersion::tls_1_2};
   mutable bool useAdditionalData_{true};
 
  private:

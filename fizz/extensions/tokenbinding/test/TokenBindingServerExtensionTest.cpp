@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/extensions/tokenbinding/TokenBindingContext.h>
 #include <fizz/extensions/tokenbinding/TokenBindingServerExtension.h>
@@ -15,10 +15,7 @@
 #include <fizz/record/Extensions.h>
 #include <fizz/server/ServerExtensions.h>
 
-using namespace folly;
-using namespace folly::io;
 
-using testing::_;
 using namespace testing;
 
 namespace fizz {

@@ -6,13 +6,12 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/crypto/RandomGenerator.h>
 
 #include <fizz/crypto/test/TestUtil.h>
 
-using namespace testing;
 
 namespace fizz {
 namespace test {

@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+# Copyright (c) Facebook, Inc. and its affiliates.
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
@@ -86,6 +87,10 @@ class FBCodeBuilder(object):
         # This raises upon detecting options that are specified but unused,
         # because otherwise it is very easy to make a typo in option names.
         self.options_used = set()
+        # Mark 'projects_dir' used even if the build installs no github
+        # projects.  This is needed because driver programs like
+        # `shell_builder.py` unconditionally set this for all builds.
+        self._github_dir = self.option('projects_dir')
         self._github_hashes = dict(_read_project_github_hashes())
 
     def __repr__(self):
@@ -154,8 +159,9 @@ class FBCodeBuilder(object):
         return self.step('Diagnostics', [
             self.comment('Builder {0}'.format(repr(self))),
             self.run(ShellQuoted('hostname')),
-            self.run(ShellQuoted('cat /etc/issue')),
+            self.run(ShellQuoted('cat /etc/issue || echo no /etc/issue')),
             self.run(ShellQuoted('g++ --version || echo g++ not installed')),
+            self.run(ShellQuoted('cmake --version || echo cmake not installed')),
         ])
 
     def step(self, name, actions):
@@ -177,52 +183,53 @@ class FBCodeBuilder(object):
         '''
         raise NotImplementedError
 
+    def debian_deps(self):
+        return [
+            'autoconf-archive',
+            'bison',
+            'build-essential',
+            'cmake',
+            'curl',
+            'flex',
+            'git',
+            'gperf',
+            'joe',
+            'libboost-all-dev',
+            'libcap-dev',
+            'libdouble-conversion-dev',
+            'libevent-dev',
+            'libgflags-dev',
+            'libgoogle-glog-dev',
+            'libkrb5-dev',
+            'libpcre3-dev',
+            'libpthread-stubs0-dev',
+            'libnuma-dev',
+            'libsasl2-dev',
+            'libsnappy-dev',
+            'libsqlite3-dev',
+            'libssl-dev',
+            'libtool',
+            'netcat-openbsd',
+            'pkg-config',
+            'sudo',
+            'unzip',
+            'wget',
+            'python3-venv',
+        ]
+
     #
     # Specific build helpers
     #
 
     def install_debian_deps(self):
         actions = [
-            self.run(ShellQuoted(
-                'apt-get update && apt-get install -yq '
-                'autoconf-archive '
-                'bison '
-                'build-essential '
-                'cmake '
-                'curl '
-                'flex '
-                'git '
-                'gperf '
-                'joe '
-                'libboost-all-dev '
-                'libcap-dev '
-                'libdouble-conversion-dev '
-                'libevent-dev '
-                'libgflags-dev '
-                'libgoogle-glog-dev '
-                'libkrb5-dev '
-                'libnuma-dev '
-                'libsasl2-dev '
-                'libsnappy-dev '
-                'libsqlite3-dev '
-                'libssl-dev '
-                'libtool '
-                'netcat-openbsd '
-                'pkg-config '
-                'sudo '
-                'unzip '
-                'wget'
-            )),
+            self.run(
+                ShellQuoted('apt-get update && apt-get install -yq {deps}').format(
+                    deps=shell_join(' ', (
+                        ShellQuoted(dep) for dep in self.debian_deps())))
+            ),
         ]
         gcc_version = self.option('gcc_version')
-
-        # We need some extra packages to be able to install GCC 4.9 on 14.04.
-        if self.option('os_image') == 'ubuntu:14.04' and gcc_version == '4.9':
-            actions.append(self.run(ShellQuoted(
-                'apt-get install -yq software-properties-common && '
-                'add-apt-repository ppa:ubuntu-toolchain-r/test && '
-                'apt-get update'
-            )))
 
         # Make the selected GCC the default before building anything
         actions.extend([
@@ -240,30 +247,26 @@ class FBCodeBuilder(object):
             self.run(ShellQuoted('update-alternatives --config gcc')),
         ])
 
-        # Ubuntu 14.04 comes with a CMake version that is too old for mstch.
-        if self.option('os_image') == 'ubuntu:14.04':
-            actions.append(self.run(ShellQuoted(
-                'apt-get install -yq software-properties-common && '
-                'add-apt-repository ppa:george-edison55/cmake-3.x && '
-                'apt-get update && '
-                'apt-get upgrade -yq cmake'
-            )))
-
-        # Debian 8.6 comes with a CMake version that is too old for folly.
-        if self.option('os_image') == 'debian:8.6':
-            actions.append(self.run(ShellQuoted(
-                'echo deb http://ftp.debian.org/debian jessie-backports main '
-                '>> /etc/apt/sources.list.d/jessie-backports.list && '
-                'apt-get update && '
-                'apt-get -yq -t jessie-backports install cmake'
-            )))
-
         actions.extend(self.debian_ccache_setup_steps())
 
         return self.step('Install packages for Debian-based OS', actions)
 
+    def create_python_venv(self):
+        action = []
+        if self.option("PYTHON_VENV", "OFF") == "ON":
+            action = self.run(ShellQuoted("python3 -m venv {p}").format(
+                p=path_join(self.option('prefix'), "venv")))
+        return(action)
+
+    def python_venv(self):
+        action = []
+        if self.option("PYTHON_VENV", "OFF") == "ON":
+            action = ShellQuoted("source {p}").format(
+                p=path_join(self.option('prefix'), "venv", "bin", "activate"))
+        return(action)
+
     def debian_ccache_setup_steps(self):
-        raise []  # It's ok to ship a renderer without ccache support.
+        return []  # It's ok to ship a renderer without ccache support.
 
     def github_project_workdir(self, project, path):
         # Only check out a non-default branch if requested. This especially
@@ -278,17 +281,19 @@ class FBCodeBuilder(object):
             self.run(ShellQuoted('git checkout {hash}').format(hash=git_hash)),
         ] if git_hash else []
 
-        base_dir = self.option('projects_dir')
-
         local_repo_dir = self.option('{0}:local_repo_dir'.format(project), '')
         return self.step('Check out {0}, workdir {1}'.format(project, path), [
-            self.workdir(base_dir),
+            self.workdir(self._github_dir),
             self.run(
-                ShellQuoted('git clone https://github.com/{p}').format(p=project)
+                ShellQuoted('git clone {opts} https://github.com/{p}').format(
+                    p=project,
+                    opts=ShellQuoted(self.option('{}:git_clone_opts'.format(project), '')))
             ) if not local_repo_dir else self.copy_local_repo(
                 local_repo_dir, os.path.basename(project)
             ),
-            self.workdir(path_join(base_dir, os.path.basename(project), path)),
+            self.workdir(
+                path_join(self._github_dir, os.path.basename(project), path),
+            ),
         ] + maybe_change_branch)
 
     def fb_github_project_workdir(self, project_and_path, github_org='facebook'):
@@ -303,7 +308,7 @@ class FBCodeBuilder(object):
         ))
 
     def parallel_make(self, make_vars=None):
-        return self.run(ShellQuoted('make -j {n} {vars}').format(
+        return self.run(ShellQuoted('make -j {n} VERBOSE=1 {vars}').format(
             n=self.option('make_parallelism'),
             vars=self._make_vars(make_vars),
         ))
@@ -311,7 +316,7 @@ class FBCodeBuilder(object):
     def make_and_install(self, make_vars=None):
         return [
             self.parallel_make(make_vars),
-            self.run(ShellQuoted('make install {vars}').format(
+            self.run(ShellQuoted('make install VERBOSE=1 {vars}').format(
                 vars=self._make_vars(make_vars),
             )),
         ]

@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/client/AsyncFizzClient.h>
 
@@ -72,10 +72,14 @@ class AsyncFizzClientTest : public Test {
   }
 
   void expectAppClose() {
-    EXPECT_CALL(*machine_, _processAppClose(_))
+    EXPECT_CALL(*machine_, _processAppCloseImmediate(_))
         .WillOnce(InvokeWithoutArgs([]() {
+          TLSContent record;
+          record.contentType = ContentType::handshake;
+          record.data = IOBuf::copyBuffer("closenotify");
+          record.encryptionLevel = EncryptionLevel::Handshake;
           WriteToSocket write;
-          write.data = IOBuf::copyBuffer("closenotify");
+          write.contents.emplace_back(std::move(record));
           return detail::actions(
               [](State& newState) { newState.state() = StateEnum::Error; },
               std::move(write));
@@ -114,6 +118,10 @@ class AsyncFizzClientTest : public Test {
             if (acceptEarlyData || pskResumed) {
               newState.pskMode() = PskKeyExchangeMode::psk_ke;
               newState.pskType() = PskType::Resumption;
+              newState.handshakeTime() =
+                  std::chrono::system_clock::now() - std::chrono::hours(1);
+            } else {
+              newState.handshakeTime() = std::chrono::system_clock::now();
             }
           };
           ReportHandshakeSuccess reportSuccess;
@@ -222,6 +230,13 @@ TEST_F(AsyncFizzClientTest, TestWriteErrorState) {
   client_->writeChain(&writeCallback_, IOBuf::copyBuffer("test"));
 }
 
+TEST_F(AsyncFizzClientTest, TestWriteNotGoodState) {
+  connect();
+  ON_CALL(*socket_, good()).WillByDefault(Return(false));
+  EXPECT_CALL(writeCallback_, writeErr_(0, _));
+  client_->writeChain(&writeCallback_, IOBuf::copyBuffer("test"));
+}
+
 TEST_F(AsyncFizzClientTest, TestHandshake) {
   completeHandshake();
   EXPECT_TRUE(client_->isReplaySafe());
@@ -272,8 +287,12 @@ TEST_F(AsyncFizzClientTest, TestWriteToSocket) {
   client_->setReadCB(&readCallback_);
   EXPECT_CALL(*machine_, _processSocketData(_, _))
       .WillOnce(InvokeWithoutArgs([]() {
+        TLSContent record;
+        record.contentType = ContentType::handshake;
+        record.data = IOBuf::copyBuffer("XYZ");
+        record.encryptionLevel = EncryptionLevel::Handshake;
         WriteToSocket write;
-        write.data = IOBuf::copyBuffer("XYZ");
+        write.contents.emplace_back(std::move(record));
         return detail::actions(std::move(write), WaitForData());
       }));
   EXPECT_CALL(*socket_, writeChain(_, _, _));
@@ -460,8 +479,8 @@ TEST_F(AsyncFizzClientTest, TestNoPskResumption) {
 
 TEST_F(AsyncFizzClientTest, TestGetCertsNone) {
   completeHandshake();
-  EXPECT_EQ(client_->getSelfCert(), nullptr);
-  EXPECT_EQ(client_->getPeerCert(), nullptr);
+  EXPECT_EQ(client_->getSelfCertificate(), nullptr);
+  EXPECT_EQ(client_->getPeerCertificate(), nullptr);
 }
 
 TEST_F(AsyncFizzClientTest, TestGetCerts) {
@@ -470,10 +489,8 @@ TEST_F(AsyncFizzClientTest, TestGetCerts) {
   connect();
   EXPECT_CALL(handshakeCallback_, _fizzHandshakeSuccess());
   fullHandshakeSuccess(false, "h2", clientCert, serverCert);
-  EXPECT_CALL(*clientCert, getX509());
-  EXPECT_EQ(client_->getSelfCert(), nullptr);
-  EXPECT_CALL(*serverCert, getX509());
-  EXPECT_EQ(client_->getPeerCert(), nullptr);
+  EXPECT_NE(client_->getSelfCertificate(), nullptr);
+  EXPECT_NE(client_->getPeerCertificate(), nullptr);
 }
 
 TEST_F(AsyncFizzClientTest, TestEarlyHandshake) {
@@ -491,10 +508,8 @@ TEST_F(AsyncFizzClientTest, TestEarlyParams) {
   params.serverCert = serverCert;
   completeEarlyHandshake(std::move(params));
   EXPECT_EQ(client_->getApplicationProtocol(), "h2");
-  EXPECT_CALL(*clientCert, getX509());
-  EXPECT_EQ(client_->getSelfCert(), nullptr);
-  EXPECT_CALL(*serverCert, getX509());
-  EXPECT_EQ(client_->getPeerCert(), nullptr);
+  EXPECT_NE(client_->getSelfCertificate(), nullptr);
+  EXPECT_NE(client_->getPeerCertificate(), nullptr);
 }
 
 TEST_F(AsyncFizzClientTest, TestEarlyApplicationProtocolNone) {
@@ -938,11 +953,47 @@ TEST_F(AsyncFizzClientTest, TestErrorStopsActions) {
   completeHandshake();
   client_->setReadCB(&readCallback_);
   EXPECT_CALL(*machine_, _processSocketData(_, _))
-      .WillOnce(InvokeWithoutArgs(
-          []() { return detail::actions(ReportError("unit test")); }));
+      .WillOnce(InvokeWithoutArgs([]() {
+        return detail::actions(
+            [](State& newState) { newState.state() = StateEnum::Error; },
+            ReportError("unit test"));
+      }));
   EXPECT_FALSE(client_->error());
+  EXPECT_TRUE(client_->good());
   socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
   EXPECT_TRUE(client_->error());
+  EXPECT_FALSE(client_->good());
+}
+
+TEST_F(AsyncFizzClientTest, TestTransportError) {
+  completeHandshake();
+  client_->setReadCB(&readCallback_);
+  EXPECT_CALL(*machine_, _processSocketData(_, _)).Times(0);
+  EXPECT_FALSE(client_->error());
+  EXPECT_TRUE(client_->good());
+  ON_CALL(*socket_, error()).WillByDefault(Return(true));
+  AsyncSocketException ase(AsyncSocketException::UNKNOWN, "unit test");
+  socketReadCallback_->readErr(ase);
+  EXPECT_TRUE(client_->error());
+  EXPECT_FALSE(client_->good());
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
+  EXPECT_TRUE(client_->error());
+  EXPECT_FALSE(client_->good());
+}
+
+TEST_F(AsyncFizzClientTest, TestTransportEof) {
+  completeHandshake();
+  client_->setReadCB(&readCallback_);
+  EXPECT_CALL(*machine_, _processSocketData(_, _)).Times(0);
+  EXPECT_FALSE(client_->error());
+  EXPECT_TRUE(client_->good());
+  ON_CALL(*socket_, good()).WillByDefault(Return(false));
+  socketReadCallback_->readEOF();
+  EXPECT_FALSE(client_->error());
+  EXPECT_FALSE(client_->good());
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
+  EXPECT_FALSE(client_->error());
+  EXPECT_FALSE(client_->good());
 }
 
 TEST_F(AsyncFizzClientTest, TestNewCachedPskActions) {
@@ -966,6 +1017,18 @@ TEST_F(AsyncFizzClientTest, TestNewCachedPskActionsWithEmptyPskIdentity) {
   EXPECT_CALL(*mockPskCache_, putPsk(_, _)).Times(0);
   socketReadCallback_->readBufferAvailable(
       IOBuf::copyBuffer("NewSessionTicket"));
+}
+
+TEST_F(AsyncFizzClientTest, TestAsyncFizzClientDestructor) {
+  socket_ = new MockAsyncTransport();
+  auto transport = AsyncTransportWrapper::UniquePtr(socket_);
+  auto fizzClient = new AsyncFizzClientT<MockClientStateMachineInstance>(
+      std::move(transport), context_);
+  bool destructible = std::is_destructible<
+      AsyncFizzClientT<MockClientStateMachineInstance>>::value;
+  EXPECT_FALSE(destructible);
+  std::shared_ptr<AsyncTransportWrapper> client{
+      fizzClient, folly::DelayedDestruction::Destructor()};
 }
 
 } // namespace test

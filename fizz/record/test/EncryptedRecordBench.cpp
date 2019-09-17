@@ -1,11 +1,12 @@
 // Copyright 2004-present Facebook. All Rights Reserved.
+#include <iostream>
 #include <vector>
 
 #include <folly/Benchmark.h>
 #include <folly/Random.h>
 #include <folly/init/Init.h>
-#include <folly/ssl/Init.h>
 
+#include <fizz/crypto/Utils.h>
 #include <fizz/crypto/aead/AESGCM128.h>
 #include <fizz/crypto/aead/AESOCB128.h>
 #include <fizz/crypto/aead/OpenSSLEVPCipher.h>
@@ -43,22 +44,90 @@ TrafficKey getKey() {
 void encryptGCM(uint32_t n, size_t size) {
   std::unique_ptr<Aead> aead;
   std::vector<fizz::TLSMessage> msgs;
-  EncryptedWriteRecordLayer write;
+  EncryptedWriteRecordLayer write{EncryptionLevel::AppTraffic};
   BENCHMARK_SUSPEND {
     aead = std::make_unique<OpenSSLEVPCipher<AESGCM128>>();
     aead->setKey(getKey());
-    write.setAead(std::move(aead));
+    write.setAead(folly::ByteRange(), std::move(aead));
     for (size_t i = 0; i < n; ++i) {
       TLSMessage msg{ContentType::application_data, makeRandom(size)};
       msgs.push_back(std::move(msg));
     }
   }
 
-  std::unique_ptr<folly::IOBuf> buf;
+  TLSContent content;
   for (auto& msg : msgs) {
-    buf = write.write(std::move(msg));
+    content = write.write(std::move(msg));
   }
-  doNotOptimizeAway(buf);
+  folly::doNotOptimizeAway(content);
+}
+
+void decryptGCM(uint32_t n, size_t size) {
+  std::vector<folly::IOBufQueue> contents;
+  EncryptedReadRecordLayer read{EncryptionLevel::AppTraffic};
+  BENCHMARK_SUSPEND {
+    EncryptedWriteRecordLayer write{EncryptionLevel::AppTraffic};
+    auto writeAead = std::make_unique<OpenSSLEVPCipher<AESGCM128>>();
+    auto readAead = std::make_unique<OpenSSLEVPCipher<AESGCM128>>();
+    writeAead->setKey(getKey());
+    readAead->setKey(getKey());
+    write.setAead(folly::ByteRange(), std::move(writeAead));
+    read.setAead(folly::ByteRange(), std::move(readAead));
+    for (size_t i = 0; i < n; ++i) {
+      TLSMessage msg{ContentType::application_data, makeRandom(size)};
+      auto content = write.write(std::move(msg));
+      folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+      queue.append(std::move(content.data));
+      folly::doNotOptimizeAway(queue.front());
+      contents.push_back(std::move(queue));
+    }
+  }
+
+  folly::Optional<TLSMessage> msg;
+  for (auto& buf : contents) {
+    msg = read.read(buf);
+  }
+  folly::doNotOptimizeAway(msg);
+}
+
+void decryptGCMNoRecord(uint32_t n, size_t size) {
+  std::unique_ptr<Aead> readAead;
+  folly::IOBufQueue queue{folly::IOBufQueue::cacheChainLength()};
+  std::vector<std::unique_ptr<folly::IOBuf>> contents;
+  auto aad = folly::IOBuf::copyBuffer("aad");
+  BENCHMARK_SUSPEND {
+    auto writeAead = std::make_unique<OpenSSLEVPCipher<AESGCM128>>();
+    readAead = std::make_unique<OpenSSLEVPCipher<AESGCM128>>();
+    writeAead->setKey(getKey());
+    readAead->setKey(getKey());
+    for (size_t i = 0; i < n; ++i) {
+      auto out = writeAead->encrypt(makeRandom(size), aad.get(), 0);
+      contents.push_back(std::move(out));
+    }
+  }
+
+  std::unique_ptr<folly::IOBuf> in;
+  for (auto& buf : contents) {
+    in = readAead->decrypt(std::move(buf), aad.get(), 0);
+  }
+  folly::doNotOptimizeAway(in);
+}
+
+void touchEveryByte(uint32_t n, size_t size) {
+  std::vector<std::unique_ptr<folly::IOBuf>> contents;
+  BENCHMARK_SUSPEND {
+    for (size_t i = 0; i < n; ++i) {
+      contents.push_back(makeRandom(size));
+    }
+  }
+
+  int isTrue = 0;
+  for (auto& buf : contents) {
+    for (size_t i = 0; i < buf->length(); ++i) {
+      isTrue ^= buf->data()[i];
+    }
+  }
+  folly::doNotOptimizeAway(isTrue);
 }
 
 BENCHMARK_PARAM(encryptGCM, 10);
@@ -67,26 +136,38 @@ BENCHMARK_PARAM(encryptGCM, 1000);
 BENCHMARK_PARAM(encryptGCM, 4000);
 BENCHMARK_PARAM(encryptGCM, 8000);
 
+BENCHMARK_PARAM(decryptGCM, 10);
+BENCHMARK_PARAM(decryptGCM, 1000);
+BENCHMARK_PARAM(decryptGCM, 8000);
+
+BENCHMARK_PARAM(decryptGCMNoRecord, 10);
+BENCHMARK_PARAM(decryptGCMNoRecord, 1000);
+BENCHMARK_PARAM(decryptGCMNoRecord, 8000);
+
+BENCHMARK_PARAM(touchEveryByte, 10);
+BENCHMARK_PARAM(touchEveryByte, 1000);
+BENCHMARK_PARAM(touchEveryByte, 8000);
+
 #if FOLLY_OPENSSL_IS_110 && !defined(OPENSSL_NO_OCB)
 void encryptOCB(uint32_t n, size_t size) {
   std::unique_ptr<Aead> aead;
   std::vector<fizz::TLSMessage> msgs;
-  EncryptedWriteRecordLayer write;
+  EncryptedWriteRecordLayer write{EncryptionLevel::AppTraffic};
   BENCHMARK_SUSPEND {
     aead = std::make_unique<OpenSSLEVPCipher<AESOCB128>>();
     aead->setKey(getKey());
-    write.setAead(std::move(aead));
+    write.setAead(folly::ByteRange(), std::move(aead));
     for (size_t i = 0; i < n; ++i) {
       TLSMessage msg{ContentType::application_data, makeRandom(size)};
       msgs.push_back(std::move(msg));
     }
   }
 
-  std::unique_ptr<folly::IOBuf> buf;
+  TLSContent content;
   for (auto& msg : msgs) {
-    buf = write.write(std::move(msg));
+    content = write.write(std::move(msg));
   }
-  doNotOptimizeAway(buf);
+  folly::doNotOptimizeAway(content);
 }
 
 BENCHMARK_PARAM(encryptOCB, 10);
@@ -98,7 +179,7 @@ BENCHMARK_PARAM(encryptOCB, 8000);
 
 int main(int argc, char** argv) {
   folly::init(&argc, &argv);
-  folly::ssl::init();
+  CryptoUtils::init();
   folly::runBenchmarks();
   return 0;
 }

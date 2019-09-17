@@ -53,20 +53,10 @@ inline SupportedGroups getExtension(folly::io::Cursor& cs) {
 }
 
 template <>
-inline folly::Optional<ClientKeyShare> getExtension(
-    const std::vector<Extension>& extensions) {
+inline ClientKeyShare getExtension(folly::io::Cursor& cs) {
   ClientKeyShare share;
-  auto it = findExtension(extensions, ExtensionType::key_share);
-  if (it == extensions.end()) {
-    it = findExtension(extensions, ExtensionType::key_share_old);
-    if (it == extensions.end()) {
-      return folly::none;
-    }
-    share.preDraft23 = true;
-  }
-  folly::io::Cursor cs{it->extension_data.get()};
   detail::readVector<uint16_t>(share.client_shares, cs);
-  return std::move(share);
+  return share;
 }
 
 template <>
@@ -165,6 +155,13 @@ inline CertificateAuthorities getExtension(folly::io::Cursor& cs) {
 }
 
 template <>
+inline CertificateCompressionAlgorithms getExtension(folly::io::Cursor& cs) {
+  CertificateCompressionAlgorithms cca;
+  detail::readVector<uint8_t>(cca.algorithms, cs);
+  return cca;
+}
+
+template <>
 inline Extension encodeExtension(const SignatureAlgorithms& sig) {
   Extension ext;
   ext.extension_type = ExtensionType::signature_algorithms;
@@ -187,8 +184,7 @@ inline Extension encodeExtension(const SupportedGroups& groups) {
 template <>
 inline Extension encodeExtension(const ClientKeyShare& share) {
   Extension ext;
-  ext.extension_type = share.preDraft23 ? ExtensionType::key_share_old
-                                        : ExtensionType::key_share;
+  ext.extension_type = ExtensionType::key_share;
   ext.extension_data = folly::IOBuf::create(0);
   folly::io::Appender appender(ext.extension_data.get(), 10);
   detail::writeVector<uint16_t>(share.client_shares, appender);
@@ -198,8 +194,7 @@ inline Extension encodeExtension(const ClientKeyShare& share) {
 template <>
 inline Extension encodeExtension(const ServerKeyShare& share) {
   Extension ext;
-  ext.extension_type = share.preDraft23 ? ExtensionType::key_share_old
-                                        : ExtensionType::key_share;
+  ext.extension_type = ExtensionType::key_share;
   ext.extension_data = folly::IOBuf::create(0);
   folly::io::Appender appender(ext.extension_data.get(), 10);
   detail::write(share.server_share, appender);
@@ -209,8 +204,7 @@ inline Extension encodeExtension(const ServerKeyShare& share) {
 template <>
 inline Extension encodeExtension(const HelloRetryRequestKeyShare& share) {
   Extension ext;
-  ext.extension_type = share.preDraft23 ? ExtensionType::key_share_old
-                                        : ExtensionType::key_share;
+  ext.extension_type = ExtensionType::key_share;
   ext.extension_data = folly::IOBuf::create(0);
   folly::io::Appender appender(ext.extension_data.get(), 10);
   detail::write(share.selected_group, appender);
@@ -317,11 +311,7 @@ inline Extension encodeExtension(const ProtocolNameList& names) {
 template <>
 inline Extension encodeExtension(const ServerNameList& names) {
   Extension ext;
-  if (names.useAlternateCodePoint) {
-    ext.extension_type = ExtensionType::alternate_server_name;
-  } else {
-    ext.extension_type = ExtensionType::server_name;
-  }
+  ext.extension_type = ExtensionType::server_name;
   ext.extension_data = folly::IOBuf::create(0);
   folly::io::Appender appender(ext.extension_data.get(), 10);
   detail::writeVector<uint16_t>(names.server_name_list, appender);
@@ -335,6 +325,16 @@ inline Extension encodeExtension(const CertificateAuthorities& authorities) {
   ext.extension_data = folly::IOBuf::create(0);
   folly::io::Appender appender(ext.extension_data.get(), 10);
   detail::writeVector<uint16_t>(authorities.authorities, appender);
+  return ext;
+}
+
+template <>
+inline Extension encodeExtension(const CertificateCompressionAlgorithms& cca) {
+  Extension ext;
+  ext.extension_type = ExtensionType::compress_certificate;
+  ext.extension_data = folly::IOBuf::create(0);
+  folly::io::Appender appender(ext.extension_data.get(), 10);
+  detail::writeVector<uint8_t>(cca.algorithms, appender);
   return ext;
 }
 

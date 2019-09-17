@@ -31,6 +31,7 @@ enum class StateEnum {
   AcceptingEarlyData,
   ExpectingFinished,
   AcceptingData,
+  ExpectingCloseNotify,
   Closed,
   Error,
   NUM_STATES
@@ -178,6 +179,13 @@ class State {
   }
 
   /**
+   * AppToken seen in session ticket if session was resumed.
+   */
+  const folly::Optional<Buf>& appToken() const {
+    return appToken_;
+  }
+
+  /**
    * Callback to application that validates appToken from ResumptionState.
    * If this function returns false, early data should be rejected.
    */
@@ -260,6 +268,15 @@ class State {
   }
 
   /**
+   * Get the certificate compression algorithm used for the sent certificate
+   * (if any).
+   */
+  const folly::Optional<CertificateCompressionAlgorithm>& serverCertCompAlgo()
+      const {
+    return serverCertCompAlgo_;
+  }
+
+  /**
    * Get the early exporter master secret. Only available if early data was
    * accepted.
    */
@@ -272,6 +289,14 @@ class State {
    */
   const folly::Optional<Buf>& exporterMasterSecret() const {
     return exporterMasterSecret_;
+  }
+
+  /**
+   * Get the timestamp for the handshake that authenticated this connection.
+   */
+  const folly::Optional<std::chrono::system_clock::time_point>& handshakeTime()
+      const {
+    return handshakeTime_;
   }
 
   /*
@@ -306,6 +331,9 @@ class State {
   }
   auto& clientCert() {
     return clientCert_;
+  }
+  auto& serverCertCompAlgo() {
+    return serverCertCompAlgo_;
   }
   auto& unverifiedCertChain() {
     return unverifiedCertChain_;
@@ -346,6 +374,9 @@ class State {
   auto& clientClockSkew() {
     return clientClockSkew_;
   }
+  auto& appToken() {
+    return appToken_;
+  }
   auto& appTokenValidator() {
     return appTokenValidator_;
   }
@@ -363,6 +394,9 @@ class State {
   }
   auto& exporterMasterSecret() {
     return exporterMasterSecret_;
+  }
+  auto& handshakeTime() {
+    return handshakeTime_;
   }
 
  private:
@@ -383,6 +417,7 @@ class State {
 
   std::shared_ptr<const Cert> serverCert_;
   std::shared_ptr<const Cert> clientCert_;
+  folly::Optional<CertificateCompressionAlgorithm> serverCertCompAlgo_;
 
   folly::Optional<std::vector<std::shared_ptr<const PeerCert>>>
       unverifiedCertChain_;
@@ -399,20 +434,20 @@ class State {
   folly::Optional<Buf> clientHandshakeSecret_;
   folly::Optional<std::string> alpn_;
   folly::Optional<std::chrono::milliseconds> clientClockSkew_;
+  folly::Optional<Buf> appToken_;
   std::unique_ptr<AppTokenValidator> appTokenValidator_;
   std::shared_ptr<ServerExtensions> extensions_;
   std::vector<uint8_t> resumptionMasterSecret_;
+  folly::Optional<std::chrono::system_clock::time_point> handshakeTime_;
 
   std::unique_ptr<HandshakeLogging> handshakeLogging_;
 
   folly::Optional<Buf> earlyExporterMasterSecret_;
   folly::Optional<Buf> exporterMasterSecret_;
 };
-} // namespace server
 
 folly::StringPiece toString(server::StateEnum state);
 
-namespace server {
 inline std::ostream& operator<<(std::ostream& os, StateEnum state) {
   os << toString(state);
   return os;

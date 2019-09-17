@@ -7,6 +7,7 @@
  */
 
 #include <fizz/protocol/Certificate.h>
+#include <openssl/bio.h>
 
 namespace {
 int getCurveName(EVP_PKEY* key) {
@@ -27,14 +28,17 @@ Buf CertUtils::prepareSignData(
       "TLS 1.3, server CertificateVerify";
   static constexpr folly::StringPiece kClientLabel =
       "TLS 1.3, client CertificateVerify";
+  static constexpr folly::StringPiece kAuthLabel = "Exported Authenticator";
   static constexpr size_t kSigPrefixLen = 64;
   static constexpr uint8_t kSigPrefix = 32;
 
   folly::StringPiece label;
   if (context == CertificateVerifyContext::Server) {
     label = kServerLabel;
-  } else {
+  } else if (context == CertificateVerifyContext::Client) {
     label = kClientLabel;
+  } else {
+    label = kAuthLabel;
   }
 
   size_t sigDataLen = kSigPrefixLen + label.size() + 1 + toBeSigned.size();
@@ -117,33 +121,61 @@ std::unique_ptr<PeerCert> CertUtils::makePeerCert(Buf certData) {
   throw std::runtime_error("unknown peer cert type");
 }
 
-std::unique_ptr<SelfCert> CertUtils::makeSelfCert(
+namespace {
+
+std::unique_ptr<SelfCert> selfCertFromDataInternal(
     std::string certData,
-    std::string keyData) {
+    std::string keyData,
+    char* password,
+    const std::vector<std::shared_ptr<CertificateCompressor>>& compressors) {
   auto certs = folly::ssl::OpenSSLCertUtils::readCertsFromBuffer(
       folly::StringPiece(certData));
   if (certs.empty()) {
     throw std::runtime_error("no certificates read");
   }
 
-  folly::ssl::BioUniquePtr b(BIO_new_mem_buf(keyData.data(), keyData.size()));
+  folly::ssl::BioUniquePtr b(BIO_new_mem_buf(
+      const_cast<void*>( // needed by openssl 1.0.2d at least
+          reinterpret_cast<const void*>(keyData.data())),
+      keyData.size()));
 
   if (!b) {
     throw std::runtime_error("failed to create BIO");
   }
+
   folly::ssl::EvpPkeyUniquePtr key(
-      PEM_read_bio_PrivateKey(b.get(), nullptr, nullptr, nullptr));
+      PEM_read_bio_PrivateKey(b.get(), nullptr, nullptr, password));
 
   if (!key) {
     throw std::runtime_error("Failed to read key");
   }
 
-  return makeSelfCert(std::move(certs), std::move(key));
+  return CertUtils::makeSelfCert(std::move(certs), std::move(key), compressors);
+}
+
+} // namespace
+
+std::unique_ptr<SelfCert> CertUtils::makeSelfCert(
+    std::string certData,
+    std::string keyData,
+    const std::vector<std::shared_ptr<CertificateCompressor>>& compressors) {
+  return selfCertFromDataInternal(
+      std::move(certData), std::move(keyData), nullptr, compressors);
+}
+
+std::unique_ptr<SelfCert> CertUtils::makeSelfCert(
+    std::string certData,
+    std::string encryptedKeyData,
+    std::string password,
+    const std::vector<std::shared_ptr<CertificateCompressor>>& compressors) {
+  return selfCertFromDataInternal(
+      std::move(certData), std::move(encryptedKeyData), &password[0], compressors);
 }
 
 std::unique_ptr<SelfCert> CertUtils::makeSelfCert(
     std::vector<folly::ssl::X509UniquePtr> certs,
-    folly::ssl::EvpPkeyUniquePtr key) {
+    folly::ssl::EvpPkeyUniquePtr key,
+    const std::vector<std::shared_ptr<CertificateCompressor>>& compressors) {
   folly::ssl::EvpPkeyUniquePtr pubKey(X509_get_pubkey(certs.front().get()));
   if (!pubKey) {
     throw std::runtime_error("Failed to read public key");
@@ -151,23 +183,33 @@ std::unique_ptr<SelfCert> CertUtils::makeSelfCert(
 
   if (EVP_PKEY_id(pubKey.get()) == EVP_PKEY_RSA) {
     return std::make_unique<SelfCertImpl<KeyType::RSA>>(
-        std::move(key), std::move(certs));
+        std::move(key), std::move(certs), compressors);
   } else if (EVP_PKEY_id(pubKey.get()) == EVP_PKEY_EC) {
     switch (getCurveName(pubKey.get())) {
       case NID_X9_62_prime256v1:
         return std::make_unique<SelfCertImpl<KeyType::P256>>(
-            std::move(key), std::move(certs));
+            std::move(key), std::move(certs), compressors);
       case NID_secp384r1:
         return std::make_unique<SelfCertImpl<KeyType::P384>>(
-            std::move(key), std::move(certs));
+            std::move(key), std::move(certs), compressors);
       case NID_secp521r1:
         return std::make_unique<SelfCertImpl<KeyType::P521>>(
-            std::move(key), std::move(certs));
+            std::move(key), std::move(certs), compressors);
       default:
         break;
     }
   }
   throw std::runtime_error("unknown self cert type");
+}
+
+CompressedCertificate CertUtils::cloneCompressedCert(
+    const CompressedCertificate& src) {
+  CompressedCertificate ret;
+  ret.algorithm = src.algorithm;
+  ret.compressed_certificate_message =
+      src.compressed_certificate_message->clone();
+  ret.uncompressed_length = src.uncompressed_length;
+  return ret;
 }
 
 IdentityCert::IdentityCert(std::string identity) : identity_(identity) {}

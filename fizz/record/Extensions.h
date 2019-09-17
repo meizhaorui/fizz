@@ -32,22 +32,16 @@ struct KeyShareEntry {
 
 struct ClientKeyShare {
   std::vector<KeyShareEntry> client_shares;
-
-  bool preDraft23{false};
   static constexpr ExtensionType extension_type = ExtensionType::key_share;
 };
 
 struct ServerKeyShare {
   KeyShareEntry server_share;
-
-  bool preDraft23{false};
   static constexpr ExtensionType extension_type = ExtensionType::key_share;
 };
 
 struct HelloRetryRequestKeyShare {
   NamedGroup selected_group;
-
-  bool preDraft23{false};
   static constexpr ExtensionType extension_type = ExtensionType::key_share;
 };
 
@@ -126,8 +120,6 @@ struct ServerName {
 
 struct ServerNameList {
   std::vector<ServerName> server_name_list;
-
-  bool useAlternateCodePoint{false};
   static constexpr ExtensionType extension_type = ExtensionType::server_name;
 };
 
@@ -141,14 +133,16 @@ struct CertificateAuthorities {
       ExtensionType::certificate_authorities;
 };
 
+struct CertificateCompressionAlgorithms {
+  std::vector<CertificateCompressionAlgorithm> algorithms;
+  static constexpr ExtensionType extension_type =
+      ExtensionType::compress_certificate;
+};
+
 template <class T>
 folly::Optional<T> getExtension(const std::vector<Extension>& extension);
 template <class T>
 T getExtension(folly::io::Cursor& cursor);
-
-template <>
-folly::Optional<ClientKeyShare> getExtension(
-    const std::vector<Extension>& extensions);
 
 template <class T>
 Extension encodeExtension(const T& t);

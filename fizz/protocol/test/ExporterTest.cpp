@@ -6,12 +6,12 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/protocol/Exporter.h>
+#include <fizz/protocol/OpenSSLFactory.h>
 
 using namespace folly;
-using namespace testing;
 
 namespace fizz {
 namespace test {
@@ -22,7 +22,9 @@ StringPiece basic_expected_ekm = {
     "55549d2d280d8507823a80c2ee69530e5dcc6a04e86f1bae1ef23a86337341a8"};
 
 TEST(ExporterTest, TestExporterBasic) {
+  OpenSSLFactory factory;
   auto ekm = Exporter::getEkm(
+      factory,
       CipherSuite::TLS_AES_128_GCM_SHA256,
       folly::Range<const char*>(exporter_master),
       label,

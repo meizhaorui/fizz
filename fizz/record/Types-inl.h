@@ -390,12 +390,37 @@ inline Buf encode<CertificateRequest>(CertificateRequest&& cr) {
 }
 
 template <>
-inline Buf encode<CertificateMsg>(CertificateMsg&& cert) {
+inline Buf encode<const CertificateMsg&>(const CertificateMsg& cert) {
   auto buf = folly::IOBuf::create(20);
   folly::io::Appender appender(buf.get(), 20);
   detail::writeBuf<uint8_t>(cert.certificate_request_context, appender);
   detail::writeVector<detail::bits24>(cert.certificate_list, appender);
   return buf;
+}
+
+template <>
+inline Buf encode<CertificateMsg&>(CertificateMsg& cert) {
+  return encode<const CertificateMsg&>(cert);
+}
+
+template <>
+inline Buf encode<CertificateMsg>(CertificateMsg&& cert) {
+  return encode<CertificateMsg&>(cert);
+}
+
+template <>
+inline Buf encode<CompressedCertificate&>(CompressedCertificate& cc) {
+  auto buf = folly::IOBuf::create(20);
+  folly::io::Appender appender(buf.get(), 20);
+  detail::write(cc.algorithm, appender);
+  detail::writeBits24(cc.uncompressed_length, appender);
+  detail::writeBuf<detail::bits24>(cc.compressed_certificate_message, appender);
+  return buf;
+}
+
+template <>
+inline Buf encode<CompressedCertificate>(CompressedCertificate&& cc) {
+  return encode<CompressedCertificate&>(cc);
 }
 
 template <>
@@ -460,11 +485,11 @@ inline Buf encode<NewSessionTicket>(NewSessionTicket&& nst) {
   return buf;
 }
 
-template <>
-inline Buf encode<HkdfLabel>(HkdfLabel&& label) {
-  static constexpr folly::StringPiece kLabelPrefix = "tls13 ";
+inline Buf encodeHkdfLabel(
+    HkdfLabel&& label,
+    const std::string& hkdfLabelPrefix) {
   auto labelBuf = folly::IOBuf::copyBuffer(
-      folly::to<std::string>(kLabelPrefix, label.label));
+      folly::to<std::string>(hkdfLabelPrefix, label.label));
   auto buf = folly::IOBuf::create(sizeof(label.length) + label.label.size());
   folly::io::Appender appender(buf.get(), 20);
   detail::write(label.length, appender);
@@ -553,6 +578,15 @@ inline CertificateMsg decode(folly::io::Cursor& cursor) {
   detail::readBuf<uint8_t>(cert.certificate_request_context, cursor);
   detail::readVector<detail::bits24>(cert.certificate_list, cursor);
   return cert;
+}
+
+template <>
+inline CompressedCertificate decode(folly::io::Cursor& cursor) {
+  CompressedCertificate cc;
+  detail::read(cc.algorithm, cursor);
+  cc.uncompressed_length = detail::readBits24(cursor);
+  detail::readBuf<detail::bits24>(cc.compressed_certificate_message, cursor);
+  return cc;
 }
 
 template <>

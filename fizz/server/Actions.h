@@ -45,9 +45,11 @@ using Action = boost::variant<
     ReportHandshakeSuccess,
     ReportEarlyHandshakeSuccess,
     ReportError,
+    EndOfData,
     MutateState,
     WaitForData,
-    AttemptVersionFallback>;
+    AttemptVersionFallback,
+    SecretAvailable>;
 using Actions = folly::small_vector<Action, 4>;
 using AsyncActions = boost::variant<Actions, folly::Future<Actions>>;
 

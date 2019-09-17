@@ -22,6 +22,7 @@
 #include <fizz/protocol/KeyScheduler.h>
 #include <fizz/record/EncryptedRecordLayer.h>
 #include <fizz/record/PlaintextRecordLayer.h>
+#include <fizz/record/Types.h>
 
 namespace fizz {
 
@@ -43,13 +44,13 @@ class Factory {
   }
 
   virtual std::unique_ptr<EncryptedReadRecordLayer>
-  makeEncryptedReadRecordLayer() const {
-    return std::make_unique<EncryptedReadRecordLayer>();
+  makeEncryptedReadRecordLayer(EncryptionLevel encryptionLevel) const {
+    return std::make_unique<EncryptedReadRecordLayer>(encryptionLevel);
   }
 
   virtual std::unique_ptr<EncryptedWriteRecordLayer>
-  makeEncryptedWriteRecordLayer() const {
-    return std::make_unique<EncryptedWriteRecordLayer>();
+  makeEncryptedWriteRecordLayer(EncryptionLevel encryptionLevel) const {
+    return std::make_unique<EncryptedWriteRecordLayer>(encryptionLevel);
   }
 
   virtual std::unique_ptr<KeyScheduler> makeKeyScheduler(
@@ -59,32 +60,10 @@ class Factory {
   }
 
   virtual std::unique_ptr<KeyDerivation> makeKeyDeriver(
-      CipherSuite cipher) const {
-    switch (cipher) {
-      case CipherSuite::TLS_CHACHA20_POLY1305_SHA256:
-      case CipherSuite::TLS_AES_128_GCM_SHA256:
-      case CipherSuite::TLS_AES_128_OCB_SHA256_EXPERIMENTAL:
-        return std::make_unique<KeyDerivationImpl<Sha256>>();
-      case CipherSuite::TLS_AES_256_GCM_SHA384:
-        return std::make_unique<KeyDerivationImpl<Sha384>>();
-      default:
-        throw std::runtime_error("ks: not implemented");
-    }
-  }
+      CipherSuite cipher) const = 0;
 
   virtual std::unique_ptr<HandshakeContext> makeHandshakeContext(
-      CipherSuite cipher) const {
-    switch (cipher) {
-      case CipherSuite::TLS_CHACHA20_POLY1305_SHA256:
-      case CipherSuite::TLS_AES_128_GCM_SHA256:
-      case CipherSuite::TLS_AES_128_OCB_SHA256_EXPERIMENTAL:
-        return std::make_unique<HandshakeContextImpl<Sha256>>();
-      case CipherSuite::TLS_AES_256_GCM_SHA384:
-        return std::make_unique<HandshakeContextImpl<Sha384>>();
-      default:
-        throw std::runtime_error("hs: not implemented");
-    }
-  }
+      CipherSuite cipher) const = 0;
 
   virtual std::unique_ptr<KeyExchange> makeKeyExchange(NamedGroup group) const {
     switch (group) {
@@ -126,6 +105,10 @@ class Factory {
 
   virtual std::shared_ptr<PeerCert> makePeerCert(Buf certData) const {
     return CertUtils::makePeerCert(std::move(certData));
+  }
+
+  virtual std::string getHkdfPrefix() const {
+    return kHkdfLabelPrefix.str();
   }
 };
 } // namespace fizz

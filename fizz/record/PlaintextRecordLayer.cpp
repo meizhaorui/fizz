@@ -39,9 +39,7 @@ folly::Optional<TLSMessage> PlaintextReadRecordLayer::read(
         if (buf.chainLength() < (cursor - buf.front()) + length) {
           return folly::none;
         }
-        length +=
-            sizeof(ContentType) + sizeof(ProtocolVersion) + sizeof(uint16_t);
-        buf.trimStart(length);
+        buf.trimStart(static_cast<size_t>(kPlaintextHeaderSize) + length);
         continue;
       } else if (msg.type != ContentType::change_cipher_spec) {
         skipEncryptedRecords_ = false;
@@ -90,22 +88,26 @@ folly::Optional<TLSMessage> PlaintextReadRecordLayer::read(
       }
     }
 
-    return std::move(msg);
+    return msg;
   }
 }
 
-Buf PlaintextWriteRecordLayer::write(TLSMessage&& msg) const {
-  return write(std::move(msg), recordVersion_);
+EncryptionLevel PlaintextReadRecordLayer::getEncryptionLevel() const {
+  return EncryptionLevel::Plaintext;
 }
 
-Buf PlaintextWriteRecordLayer::writeInitialClientHello(
+TLSContent PlaintextWriteRecordLayer::write(TLSMessage&& msg) const {
+  return write(std::move(msg), ProtocolVersion::tls_1_2);
+}
+
+TLSContent PlaintextWriteRecordLayer::writeInitialClientHello(
     Buf encodedClientHello) const {
   return write(
       TLSMessage{ContentType::handshake, std::move(encodedClientHello)},
       ProtocolVersion::tls_1_0);
 }
 
-Buf PlaintextWriteRecordLayer::write(
+TLSContent PlaintextWriteRecordLayer::write(
     TLSMessage msg,
     ProtocolVersion recordVersion) const {
   if (msg.type == ContentType::application_data) {
@@ -132,6 +134,14 @@ Buf PlaintextWriteRecordLayer::write(
     }
     data->prependChain(std::move(thisFragment));
   }
-  return data;
+  TLSContent content;
+  content.data = std::move(data);
+  content.contentType = msg.type;
+  content.encryptionLevel = EncryptionLevel::Plaintext;
+  return content;
+}
+
+EncryptionLevel PlaintextWriteRecordLayer::getEncryptionLevel() const {
+  return EncryptionLevel::Plaintext;
 }
 } // namespace fizz

@@ -7,6 +7,7 @@
  */
 
 #include <fizz/client/AsyncFizzClient.h>
+#include <fizz/crypto/Utils.h>
 #include <fizz/crypto/aead/AESGCM128.h>
 #include <fizz/crypto/aead/OpenSSLEVPCipher.h>
 #include <fizz/server/AsyncFizzServer.h>
@@ -14,6 +15,7 @@
 #include <folly/String.h>
 #include <folly/io/async/AsyncSSLSocket.h>
 #include <folly/io/async/SSLContext.h>
+#include <folly/portability/GFlags.h>
 
 using namespace fizz;
 using namespace fizz::client;
@@ -77,13 +79,15 @@ class BogoTestServer : public AsyncSocket::ConnectCallback,
 
   void fizzHandshakeAttemptFallback(
       std::unique_ptr<folly::IOBuf> clientHello) override {
-    auto fd = transport_->getUnderlyingTransport<AsyncSocket>()->detachFd();
+    auto fd = transport_->getUnderlyingTransport<AsyncSocket>()
+                  ->detachNetworkSocket()
+                  .toFd();
     transport_.reset();
     if (!sslContext_) {
       unimplemented_ = true;
     } else {
-      sslSocket_ =
-          AsyncSSLSocket::UniquePtr(new AsyncSSLSocket(sslContext_, evb_, fd));
+      sslSocket_ = AsyncSSLSocket::UniquePtr(new AsyncSSLSocket(
+          sslContext_, evb_, folly::NetworkSocket::fromFd(fd)));
       sslSocket_->setPreReceivedData(std::move(clientHello));
       sslSocket_->sslAccept(this);
     }
@@ -94,7 +98,7 @@ class BogoTestServer : public AsyncSocket::ConnectCallback,
   }
 
   void readDataAvailable(size_t /* len */) noexcept override {
-    throw std::runtime_error("readDataAvailable not implemented");
+    CHECK(false) << "readDataAvailable not implemented";
   }
 
   bool isBufferMovable() noexcept override {
@@ -203,7 +207,7 @@ class BogoTestClient : public AsyncSocket::ConnectCallback,
   }
 
   void readDataAvailable(size_t /* len */) noexcept override {
-    throw std::runtime_error("readDataAvailable not implemented");
+    CHECK(false) << "readDataAvailable not implemented";
   }
 
   bool isBufferMovable() noexcept override {
@@ -299,7 +303,7 @@ int serverTest() {
   auto ticketCipher = std::make_shared<AES128TicketCipher>();
   auto ticketSeed = RandomGenerator<32>().generateRandom();
   ticketCipher->setTicketSecrets({{range(ticketSeed)}});
-  ticketCipher->setValidity(std::chrono::seconds(60));
+  ticketCipher->setTicketValidity(std::chrono::seconds(60));
 
   auto serverContext = std::make_shared<FizzServerContext>();
   serverContext->setCertManager(std::move(certManager));
@@ -378,7 +382,7 @@ int main(int argc, char** argv) {
 
   gflags::ParseCommandLineFlags(&argc, &argv, true);
   google::InitGoogleLogging(argv[0]);
-  OpenSSL_add_all_algorithms();
+  CryptoUtils::init();
 
   if (FLAGS_port == 0) {
     throw std::runtime_error("must specify port");

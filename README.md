@@ -1,6 +1,9 @@
 <p align="center">
   <img width="500" height="216" alt="Fizz" src="logo2x.png">
 </p>
+
+[![Build Status](https://api.travis-ci.org/facebookincubator/fizz.svg?branch=master)](https://travis-ci.org/facebookincubator/fizz)
+
 Fizz is a TLS 1.3 implementation.
 
 Fizz currently supports TLS 1.3 drafts 28, 26 (both wire-compatible with the
@@ -22,6 +25,7 @@ Fizz largely depends on three libraries: [folly](https://www.github.com/facebook
 - `fizz/protocol`: Common protocol code shared between client and server
 - `fizz/client`:   Client protocol implementation
 - `fizz/server`:   Server protocol implementation
+- `fizz/tool`:     Example CLI app source
 
 ## Design
 
@@ -72,22 +76,25 @@ helps us move fast.
 
 ## Sample Applications
 
-`ClientSocket` and `ServerSocket` provide sample usage of `AsyncFizzClient` and
-`AsyncFizzServer` and can be used to start up a simple TLS 1.3 client or server
-over a TCP connection.
+Fizz includes an example program that showcases the basic client/server functionality
+supported by Fizz. The binary is called `fizz` and it has similar usage to the
+`openssl` or `bssl` commands.
 
-For example, to start ServerSocket on port 443 with a specified cert:
+For example, to start a TLS server on port 443 with a specified cert:
 ```
-ServerSocket -port 443 -cert foo.pem -key foo.key
+fizz server -accept 443 -cert foo.pem -key foo.key
 ```
 
 Then, on the same host, you can connect with:
 
 ```
-ClientSocket -host localhost -port 443
+fizz client -connect localhost:443
 ```
-ClientSocket will dump the data it gets and both will remain running until
-interrupted via CTRL+C.
+
+Both ends will echo whatever data they receive and send any terminal input to the
+peer. Hitting CTRL+D on either end will terminate the connection.
+
+The source code for this program can be found under `fizz/tool`.
 
 ## Building
 
@@ -124,7 +131,7 @@ Then, build and install folly:
 ```
 git clone https://github.com/facebook/folly
 mkdir folly/build_ && cd folly/build_
-cmake configure ..
+cmake ..
 make -j $(nproc)
 sudo make install
 ```
@@ -135,7 +142,7 @@ And lastly, build and install fizz.
 cd ../..
 git clone https://github.com/facebookincubator/fizz
 mkdir fizz/build_ && cd fizz/build_
-cmake configure ../fizz
+cmake ../fizz
 make -j $(nproc)
 sudo make install
 ```
@@ -163,7 +170,7 @@ After building, the directory `out/` will contain the libraries as well as
 Running it again will be faster and only rebuild `fizz`.
 
 You can also install both `fizz` as well as `folly` to a custom directory
-using the build script, by supplying a `INSTALL_PREFIX` env var.
+using the build script, by supplying an `INSTALL_PREFIX` env var.
 
 ```
 INSTALL_PREFIX=/usr/local ./mac-build.sh

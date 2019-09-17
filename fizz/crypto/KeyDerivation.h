@@ -49,17 +49,33 @@ class KeyDerivation {
       folly::ByteRange ikm) = 0;
 
   virtual void hash(const folly::IOBuf& in, folly::MutableByteRange out) = 0;
+
+  virtual void hmac(
+      folly::ByteRange key,
+      const folly::IOBuf& in,
+      folly::MutableByteRange out) = 0;
 };
 
 template <typename Hash>
 class KeyDerivationImpl : public KeyDerivation {
  public:
+  ~KeyDerivationImpl() override = default;
+
+  KeyDerivationImpl(const std::string& labelPrefix);
+
   size_t hashLength() const override {
     return Hash::HashLen;
   }
 
   void hash(const folly::IOBuf& in, folly::MutableByteRange out) override {
     Hash::hash(in, out);
+  }
+
+  void hmac(
+      folly::ByteRange key,
+      const folly::IOBuf& in,
+      folly::MutableByteRange out) override {
+    Hash::hmac(key, in, out);
   }
 
   folly::ByteRange blankHash() const override {
@@ -84,6 +100,9 @@ class KeyDerivationImpl : public KeyDerivation {
       override {
     return HkdfImpl<Hash>().extract(salt, ikm);
   }
+
+ private:
+  std::string labelPrefix_;
 };
 } // namespace fizz
 

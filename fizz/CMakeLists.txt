@@ -1,14 +1,33 @@
 #  Copyright (c) 2018, Facebook, Inc.
 #  All rights reserved.
 
-cmake_minimum_required(VERSION 3.0.2)
+cmake_minimum_required(VERSION 3.1)
 
-project("fizz" VERSION 1.0.0 LANGUAGES CXX)
+project("fizz" VERSION 1.0.0 LANGUAGES CXX C)
 
 add_compile_options(-std=c++14)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
-set(CMAKE_MODULE_PATH ${CMAKE_SOURCE_DIR}/cmake/)
+set(CMAKE_MODULE_PATH
+  "${CMAKE_CURRENT_SOURCE_DIR}/cmake"
+  # for in-fbsource builds
+  "${CMAKE_CURRENT_SOURCE_DIR}/../opensource/fbcode_builder/CMake"
+  # For shipit-transformed builds
+  "${CMAKE_CURRENT_SOURCE_DIR}/../build/fbcode_builder/CMake"
+  ${CMAKE_MODULE_PATH})
+
+option(BUILD_SHARED_LIBS
+  "If enabled, build fizz as a shared library.  \
+  This is generally discouraged, since fizz does not commit to having \
+  a stable ABI."
+  OFF
+)
+# Mark BUILD_SHARED_LIBS as an "advanced" option, since enabling it
+# is generally discouraged.
+mark_as_advanced(BUILD_SHARED_LIBS)
+
+include(FBBuildOptions)
+fb_activate_static_library_option()
 
 # When installing Folly & Fizz in a non-default prefix, this will let
 # projects linking against libfizz.so to find libfolly.so automatically.
@@ -33,11 +52,10 @@ if (NOT folly_FOUND)
   find_package(Folly MODULE REQUIRED)
 endif()
 
-find_package(Boost REQUIRED COMPONENTS system thread filesystem regex context)
+find_package(Boost REQUIRED COMPONENTS system thread filesystem regex context
+                                       date_time program_options)
 find_package(OpenSSL REQUIRED)
 find_package(Glog REQUIRED)
-find_package(Gflags REQUIRED)
-find_package(Libevent REQUIRED)
 find_package(DoubleConversion REQUIRED)
 find_package(Threads REQUIRED)
 if (UNIX AND NOT APPLE)
@@ -46,11 +64,41 @@ endif()
 
 include(CheckAtomic)
 
-find_library(SODIUM sodium)
-if(SODIUM-NOTFOUND)
-  MESSAGE (FATAL_ERROR "libsodium is required")
-ENDIF()
+find_package(Sodium REQUIRED)
 
+SET(FIZZ_SHINY_DEPENDENCIES "")
+SET(FIZZ_LINK_LIBRARIES "")
+SET(FIZZ_INCLUDE_DIRECTORIES "")
+
+find_package(gflags CONFIG QUIET)
+if (gflags_FOUND)
+  message(STATUS "Found gflags from package config")
+  if (TARGET gflags-shared)
+    list(APPEND FIZZ_SHINY_DEPENDENCIES gflags-shared)
+  elseif (TARGET gflags)
+    list(APPEND FIZZ_SHINY_DEPENDENCIES gflags)
+  else()
+    message(FATAL_ERROR "Unable to determine the target name for the GFlags package.")
+  endif()
+  list(APPEND CMAKE_REQUIRED_LIBRARIES ${GFLAGS_LIBRARIES})
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${GFLAGS_INCLUDE_DIR})
+else()
+  find_package(Gflags REQUIRED MODULE)
+  list(APPEND FIZZ_LINK_LIBRARIES ${LIBGFLAGS_LIBRARY})
+  list(APPEND FIZZ_INCLUDE_DIRECTORIES ${LIBGFLAGS_INCLUDE_DIR})
+  list(APPEND CMAKE_REQUIRED_LIBRARIES ${LIBGFLAGS_LIBRARY})
+  list(APPEND CMAKE_REQUIRED_INCLUDES ${LIBGFLAGS_INCLUDE_DIR})
+endif()
+
+find_package(Libevent CONFIG QUIET)
+if(TARGET event)
+  message(STATUS "Found libevent from package config")
+  list(APPEND FIZZ_SHINY_DEPENDENCIES event)
+else()
+  find_package(Libevent MODULE REQUIRED)
+  list(APPEND FIZZ_LINK_LIBRARIES ${LIBEVENT_LIB})
+  list(APPEND FIZZ_INCLUDE_DIRECTORIES ${LIBEVENT_INCLUDE_DIR})
+endif()
 
 set(FIZZ_HEADER_DIRS
   base
@@ -60,11 +108,14 @@ set(FIZZ_HEADER_DIRS
   crypto/exchange
   crypto/signature
   crypto/openssl
-  extensions/secretlogging
+  extensions/exportedauth
   extensions/tokenbinding
   protocol
+  protocol/clock
   record
   server
+  util
+  tool
 )
 
 set(FIZZ_TEST_HEADER_DIRS
@@ -73,8 +124,11 @@ set(FIZZ_TEST_HEADER_DIRS
   crypto/exchange/test
   crypto/test
   protocol/test
+  protocol/clock/test
   record/test
   server/test
+  tool/test
+  util/test
   test
 )
 
@@ -112,6 +166,7 @@ set(FIZZ_SOURCES
   server/TicketCodec.cpp
   server/CookieCipher.cpp
   server/ReplayCache.cpp
+  server/SlidingBloomReplayCache.cpp
   protocol/AsyncFizzBase.cpp
   protocol/Types.cpp
   protocol/Exporter.cpp
@@ -119,7 +174,11 @@ set(FIZZ_SOURCES
   protocol/Events.cpp
   protocol/KeyScheduler.cpp
   protocol/Certificate.cpp
-  extensions/secretlogging/LoggingKeyScheduler.cpp
+  protocol/CertDecompressionManager.cpp
+  protocol/ZlibCertificateCompressor.cpp
+  protocol/ZlibCertificateDecompressor.cpp
+  protocol/clock/SystemClock.cpp
+  extensions/exportedauth/ExportedAuthenticator.cpp
   extensions/tokenbinding/Types.cpp
   extensions/tokenbinding/TokenBindingConstructor.cpp
   extensions/tokenbinding/TokenBindingClientExtension.cpp
@@ -128,6 +187,7 @@ set(FIZZ_SOURCES
   client/ClientProtocol.cpp
   client/SynchronizedLruPskCache.cpp
   client/EarlyDataRejectionPolicy.cpp
+  util/FizzUtil.cpp
 )
 
 add_library(fizz
@@ -150,10 +210,10 @@ target_include_directories(
     ${FOLLY_INCLUDE_DIR}
     ${Boost_INCLUDE_DIR}
     ${OPENSSL_INCLUDE_DIR}
+    ${sodium_INCLUDE_DIR}
   PRIVATE
     ${GLOG_INCLUDE_DIRS}
-    ${GFLAGS_INCLUDE_DIRS}
-    ${LIBEVENT_INCLUDE_DIRS}
+    ${FIZZ_INCLUDE_DIRECTORIES}
     ${DOUBLE_CONVERSION_INCLUDE_DIRS}
 )
 
@@ -163,14 +223,27 @@ target_link_libraries(fizz
     ${FOLLY_LIBRARIES}
     ${Boost_LIBRARIES}
     ${OPENSSL_LIBRARIES}
-    ${SODIUM}
+    # Don't use the sodium target here because it will break clients that
+    # consume fizz's exported targets (fizz-targets.cmake) since the sodium
+    # target is not exported.
+    ${sodium_LIBRARIES}
+    Threads::Threads
   PRIVATE
     ${GLOG_LIBRARIES}
     ${GFLAGS_LIBRARIES}
-    ${LIBEVENT_LIBRARIES}
+    ${FIZZ_LINK_LIBRARIES}
     ${DOUBLE_CONVERSION_LIBRARIES}
     ${CMAKE_DL_LIBS}
     ${LIBRT_LIBRARIES})
+
+if ($FIZZ_SHINY_DEPENDENCIES)
+  add_dependencies(fizz ${FIZZ_SHINY_DEPENDENCIES})
+endif()
+
+if (${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
+  # Work around C1128: number of sections exceeded object file format limit.
+  target_compile_options(fizz PUBLIC /bigobj)
+endif()
 
 install(
   TARGETS fizz
@@ -182,8 +255,10 @@ install(
 # statement above.  install(TARGETS) appears to only support installing
 # PUBLIC_HEADER in a flat include directory, and not a deeper tree.
 foreach(dir ${FIZZ_HEADER_DIRS})
-  install(DIRECTORY ${dir} DESTINATION "${INCLUDE_INSTALL_DIR}/fizz"
-          FILES_MATCHING PATTERN "*.h")
+  get_filename_component(PARENT_DIR "/${dir}" DIRECTORY)
+  install(DIRECTORY ${dir} DESTINATION "${INCLUDE_INSTALL_DIR}/fizz${PARENT_DIR}"
+          FILES_MATCHING PATTERN "*.h"
+          PATTERN "test" EXCLUDE)
 endforeach()
 
 # Install CMake package configuration files for fizz
@@ -211,6 +286,7 @@ ELSE(CMAKE_CROSSCOMPILING)
    option(BUILD_TESTS "BUILD_TESTS" ON)
 ENDIF(CMAKE_CROSSCOMPILING)
 
+SET(FIZZ_TEST_INSTALL_PREFIX ${CMAKE_INSTALL_PREFIX})
 if(BUILD_TESTS)
   enable_testing()
 
@@ -253,7 +329,6 @@ if(BUILD_TESTS)
     set(LIBGMOCK_LIBRARIES libgmock libgmock_main)
     set(LIBGMOCK_INCLUDE_DIR "${source_dir}/googlemock/include")
     set(LIBGTEST_INCLUDE_DIR "${source_dir}/googletest/include")
-    set(LIBGTEST_INCLUDE_DIR "${source_dir}/googletest/include")
   endif()
 
   add_library(fizz_test_support
@@ -266,30 +341,44 @@ if(BUILD_TESTS)
       fizz
   )
 
-  add_library(fizz_test_main
-    test/CMakeTestMain.cpp)
+  # export fizz headers and targets for unit tests utils
+  # since other projects such as mvfst and proxygen use them
+  install(
+    TARGETS fizz_test_support
+    EXPORT fizz-exports
+    ARCHIVE DESTINATION ${FIZZ_TEST_INSTALL_PREFIX}/lib
+    LIBRARY DESTINATION ${FIZZ_TEST_INSTALL_PREFIX}/lib
+  )
 
-  target_link_libraries(fizz_test_main
-    PUBLIC
+  foreach(dir ${FIZZ_TEST_HEADER_DIRS})
+    get_filename_component(PARENT_DIR "/${dir}" DIRECTORY)
+    install(
+      DIRECTORY ${dir}
+      DESTINATION "${FIZZ_TEST_INSTALL_PREFIX}/include/fizz${PARENT_DIR}"
+      FILES_MATCHING PATTERN "*.h"
+    )
+  endforeach()
+
+  macro(add_gtest test_source test_name)
+    add_executable(${test_name} ${test_source} test/CMakeTestMain.cpp)
+
+    set_property(TARGET ${test_name} PROPERTY ENABLE_EXPORTS true)
+    target_include_directories(
+      ${test_name} PUBLIC ${LIBGMOCK_INCLUDE_DIR} ${LIBGTEST_INCLUDE_DIR})
+    target_compile_definitions(${test_name} PUBLIC ${LIBGMOCK_DEFINES})
+    target_link_libraries(
+      ${test_name}
       fizz
       fizz_test_support
       ${LIBGMOCK_LIBRARIES})
 
-  target_include_directories(fizz_test_main
-    PUBLIC
-    ${LIBGMOCK_INCLUDE_DIR}
-    ${LIBGTEST_INCLUDE_DIR})
+    if(NOT ${CMAKE_CXX_COMPILER_ID} STREQUAL MSVC)
+      # GMOCK_MOCK_METHOD() will complain otherwise
+      target_compile_options(${test_name}
+        PRIVATE "-Wno-inconsistent-missing-override")
+    endif()
 
-  macro(add_gtest test_source test_name)
-  add_executable(${test_name} ${test_source})
-  target_include_directories(
-    ${test_name} PUBLIC ${LIBGMOCK_INCLUDE_DIR} ${LIBGTEST_INCLUDE_DIR})
-  target_link_libraries(${test_name}
-    fizz
-    fizz_test_support
-    fizz_test_main
-    ${LIBGMOCK_LIBRARIES})
-  add_test(${test_name} bin/${test_name})
+    add_test(${test_name} bin/${test_name})
   endmacro(add_gtest)
 
   add_gtest(client/test/SynchronizedLruPskCacheTest.cpp SyncronizedLruPskCacheTest)
@@ -318,6 +407,8 @@ if(BUILD_TESTS)
   add_gtest(protocol/test/DefaultCertificateVerifierTest.cpp DefaultCertificateVerifierTest)
   add_gtest(protocol/test/HandshakeContextTest.cpp HandshakeContextTest)
   add_gtest(protocol/test/ExporterTest.cpp ExporterTest)
+  add_gtest(protocol/test/CertDecompressionManagerTest.cpp CertDecompressionManagerTest)
+  add_gtest(protocol/test/ZlibCertificateCompressorTest.cpp ZlibCertificateCompressorTest)
   add_gtest(record/test/ExtensionsTest.cpp ExtensionsTest)
   add_gtest(record/test/EncryptedRecordTest.cpp EncryptedRecordTest)
   add_gtest(record/test/TypesTest.cpp TypesTest)
@@ -326,6 +417,7 @@ if(BUILD_TESTS)
   add_gtest(record/test/PlaintextRecordTest.cpp PlaintextRecordTest)
   add_gtest(server/test/CertManagerTest.cpp CertManagerTest)
   add_gtest(server/test/CookieCipherTest.cpp CookieCipherTest)
+  add_gtest(server/test/DualTicketCipherTest.cpp DualTicketCipherTest)
   add_gtest(server/test/AeadTicketCipherTest.cpp AeadTicketCipherTest)
   add_gtest(server/test/AsyncFizzServerTest.cpp AsyncFizzServerTest)
   add_gtest(server/test/AeadCookieCipherTest.cpp AeadCookieCipherTest)
@@ -333,6 +425,9 @@ if(BUILD_TESTS)
   add_gtest(server/test/ServerProtocolTest.cpp ServerProtocolTest)
   add_gtest(server/test/NegotiatorTest.cpp NegotiatorTest)
   add_gtest(server/test/FizzServerTest.cpp FizzServerTest)
+  add_gtest(server/test/SlidingBloomReplayCacheTest.cpp SlidingBloomReplayCacheTest)
+  add_gtest(tool/test/FizzCommandCommonTest.cpp FizzCommandCommonTest)
+  add_gtest(util/test/FizzUtilTest.cpp FizzUtilTest)
   add_gtest(test/AsyncFizzBaseTest.cpp AsyncFizzBaseTest)
   add_gtest(test/HandshakeTest.cpp HandshakeTest)
 endif()
@@ -340,10 +435,9 @@ endif()
 option(BUILD_EXAMPLES "BUILD_EXAMPLES" ON)
 
 if(BUILD_EXAMPLES)
-  add_executable(ClientSocket client/test/ClientSocket.cpp)
-  target_link_libraries(ClientSocket fizz)
-  add_executable(ServerSocket server/test/ServerSocket.cpp)
-  target_link_libraries(ServerSocket fizz)
   add_executable(BogoShim test/BogoShim.cpp)
-  target_link_libraries(BogoShim fizz)
+  target_link_libraries(BogoShim fizz sodium)
+  add_executable(FizzTool tool/Main.cpp tool/FizzClientCommand.cpp tool/FizzCommandCommon.cpp tool/FizzServerCommand.cpp)
+  target_link_libraries(FizzTool fizz sodium)
+  set_target_properties(FizzTool PROPERTIES OUTPUT_NAME fizz)
 endif()

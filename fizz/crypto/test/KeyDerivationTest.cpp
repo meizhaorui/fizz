@@ -6,9 +6,10 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/crypto/KeyDerivation.h>
+#include <fizz/crypto/Sha256.h>
 #include <folly/String.h>
 #include <folly/io/IOBuf.h>
 
@@ -34,7 +35,7 @@ TEST_P(KeyDerivationTest, ExpandLabel) {
 
   auto secret = std::vector<uint8_t>(prk.begin(), prk.end());
 
-  auto deriver = KeyDerivationImpl<Sha256>();
+  auto deriver = KeyDerivationImpl<Sha256>(kHkdfLabelPrefix.str());
   auto out = deriver.expandLabel(
       range(secret),
       GetParam().label,
@@ -46,18 +47,22 @@ TEST_P(KeyDerivationTest, ExpandLabel) {
 
 TEST(KeyDerivation, DeriveSecret) {
   // dummy prk
-  std::vector<uint8_t> secret(KeyDerivationImpl<Sha256>().hashLength());
-  std::vector<uint8_t> messageHash(KeyDerivationImpl<Sha256>().hashLength());
-  auto deriver = KeyDerivationImpl<Sha256>();
+  std::vector<uint8_t> secret(
+      KeyDerivationImpl<Sha256>(kHkdfLabelPrefix.str()).hashLength());
+  std::vector<uint8_t> messageHash(
+      KeyDerivationImpl<Sha256>(kHkdfLabelPrefix.str()).hashLength());
+  auto deriver = KeyDerivationImpl<Sha256>(kHkdfLabelPrefix.str());
   deriver.deriveSecret(range(secret), "hey", range(messageHash));
 }
 
 TEST(KeyDerivation, Sha256BlankHash) {
-  std::vector<uint8_t> computed(KeyDerivationImpl<Sha256>().hashLength());
+  std::vector<uint8_t> computed(
+      KeyDerivationImpl<Sha256>(kHkdfLabelPrefix.str()).hashLength());
   folly::IOBuf blankBuf;
   Sha256::hash(blankBuf, MutableByteRange(computed.data(), computed.size()));
   EXPECT_EQ(
-      StringPiece(KeyDerivationImpl<Sha256>().blankHash()),
+      StringPiece(
+          KeyDerivationImpl<Sha256>(kHkdfLabelPrefix.str()).blankHash()),
       StringPiece(folly::range(computed)));
 }
 

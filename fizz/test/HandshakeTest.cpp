@@ -6,17 +6,20 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/client/AsyncFizzClient.h>
 #include <fizz/client/test/Mocks.h>
+#include <fizz/crypto/Utils.h>
 #include <fizz/crypto/aead/AESGCM128.h>
 #include <fizz/crypto/aead/OpenSSLEVPCipher.h>
 #include <fizz/crypto/test/TestUtil.h>
 #include <fizz/extensions/tokenbinding/TokenBindingClientExtension.h>
 #include <fizz/extensions/tokenbinding/TokenBindingContext.h>
 #include <fizz/extensions/tokenbinding/TokenBindingServerExtension.h>
+#include <fizz/protocol/ZlibCertificateCompressor.h>
+#include <fizz/protocol/ZlibCertificateDecompressor.h>
 #include <fizz/protocol/test/Matchers.h>
 #include <fizz/protocol/test/Utilities.h>
 #include <fizz/server/AsyncFizzServer.h>
@@ -35,7 +38,7 @@ namespace fizz {
 namespace test {
 
 struct ExpectedParameters {
-  ProtocolVersion version{ProtocolVersion::tls_1_3_26};
+  ProtocolVersion version{ProtocolVersion::tls_1_3};
   CipherSuite cipher{CipherSuite::TLS_AES_128_GCM_SHA256};
   folly::Optional<SignatureScheme> scheme{
       SignatureScheme::ecdsa_secp256r1_sha256};
@@ -47,12 +50,13 @@ struct ExpectedParameters {
   folly::Optional<EarlyDataType> earlyDataType{EarlyDataType::NotAttempted};
   folly::Optional<std::string> alpn;
   std::shared_ptr<const Cert> clientCert;
+  folly::Optional<CertificateCompressionAlgorithm> serverCertCompAlgo;
 };
 
 class HandshakeTest : public Test {
  public:
   void SetUp() override {
-    OpenSSL_add_all_algorithms();
+    CryptoUtils::init();
 
     clientContext_ = std::make_shared<FizzClientContext>();
     serverContext_ = std::make_shared<FizzServerContext>();
@@ -61,11 +65,13 @@ class HandshakeTest : public Test {
     clientContext_->setPskCache(std::move(pskCache));
 
     auto certManager = std::make_unique<CertManager>();
+    std::vector<std::shared_ptr<CertificateCompressor>> compressors = {
+        std::make_shared<ZlibCertificateCompressor>(9)};
     std::vector<ssl::X509UniquePtr> rsaCerts;
     rsaCerts.emplace_back(getCert(kRSACertificate));
     certManager->addCert(
         std::make_shared<SelfCertImpl<KeyType::RSA>>(
-            getPrivateKey(kRSAKey), std::move(rsaCerts)),
+            getPrivateKey(kRSAKey), std::move(rsaCerts), compressors),
         true);
     std::vector<ssl::X509UniquePtr> p256Certs;
     std::vector<ssl::X509UniquePtr> p384Certs;
@@ -74,11 +80,11 @@ class HandshakeTest : public Test {
     p384Certs.emplace_back(getCert(kP384Certificate));
     p521Certs.emplace_back(getCert(kP521Certificate));
     certManager->addCert(std::make_shared<SelfCertImpl<KeyType::P256>>(
-        getPrivateKey(kP256Key), std::move(p256Certs)));
+        getPrivateKey(kP256Key), std::move(p256Certs), compressors));
     certManager->addCert(std::make_shared<SelfCertImpl<KeyType::P384>>(
-        getPrivateKey(kP384Key), std::move(p384Certs)));
+        getPrivateKey(kP384Key), std::move(p384Certs), compressors));
     certManager->addCert(std::make_shared<SelfCertImpl<KeyType::P521>>(
-        getPrivateKey(kP521Key), std::move(p521Certs)));
+        getPrivateKey(kP521Key), std::move(p521Certs), compressors));
     serverContext_->setCertManager(std::move(certManager));
     serverContext_->setEarlyDataSettings(
         true,
@@ -102,7 +108,7 @@ class HandshakeTest : public Test {
     auto ticketCipher = std::make_shared<AES128TicketCipher>();
     auto ticketSeed = RandomGenerator<32>().generateRandom();
     ticketCipher->setTicketSecrets({{range(ticketSeed)}});
-    ticketCipher->setValidity(std::chrono::seconds(60));
+    ticketCipher->setTicketValidity(std::chrono::seconds(60));
     serverContext_->setTicketCipher(std::move(ticketCipher));
 
     cookieCipher_ = std::make_shared<AES128CookieCipher>();
@@ -202,6 +208,10 @@ class HandshakeTest : public Test {
         .WillByDefault(Invoke([](folly::exception_wrapper ex) {
           FAIL() << "Client Error: " << ex.what().toStdString();
         }));
+    ON_CALL(clientRead_, readErr_(_))
+        .WillByDefault(Invoke([](const AsyncSocketException& ex) {
+          FAIL() << "Client Read Error: " << ex.what();
+        }));
   }
 
   void expectServerSuccess() {
@@ -210,6 +220,10 @@ class HandshakeTest : public Test {
     ON_CALL(serverCallback_, _fizzHandshakeError(_))
         .WillByDefault(Invoke([](folly::exception_wrapper ex) {
           FAIL() << "Server Error: " << ex.what().toStdString();
+        }));
+    ON_CALL(serverRead_, readErr_(_))
+        .WillByDefault(Invoke([](const AsyncSocketException& ex) {
+          FAIL() << "Server Read Error: " << ex.what();
         }));
   }
 
@@ -322,6 +336,10 @@ class HandshakeTest : public Test {
     EXPECT_EQ(server_->getState().alpn(), expected_.alpn);
     EXPECT_TRUE(
         certsMatch(server_->getState().clientCert(), expected_.clientCert));
+    EXPECT_EQ(
+        client_->getState().serverCertCompAlgo(), expected_.serverCertCompAlgo);
+    EXPECT_EQ(
+        server_->getState().serverCertCompAlgo(), expected_.serverCertCompAlgo);
   }
 
   void setupResume() {
@@ -565,7 +583,7 @@ TEST_F(HandshakeTest, PskKe) {
 
 // This test is only run with 1.1.0 as it requires chacha to run (chacha and
 // aes-gcm-128 are the only ciphers with a compatible hash algorithm).
-#if FOLLY_OPENSSL_IS_110
+#if FOLLY_OPENSSL_HAS_CHACHA
 TEST_F(HandshakeTest, ResumeChangeCipher) {
   setupResume();
   clientContext_->setSupportedCiphers(
@@ -582,7 +600,7 @@ TEST_F(HandshakeTest, ResumeChangeCipher) {
   verifyParameters();
   sendAppData();
 }
-#endif // FOLLY_OPENSSL_IS_110
+#endif // FOLLY_OPENSSL_HAS_CHACHA
 
 TEST_F(HandshakeTest, TestEkmSame) {
   expectSuccess();
@@ -690,6 +708,21 @@ TEST_F(HandshakeTest, CertRequestBadCert) {
           std::move(badCert.key), std::move(certVec)));
   expectServerError("alert: bad_certificate", "client certificate failure");
   doHandshake();
+}
+
+TEST_F(HandshakeTest, BasicCertCompression) {
+  expectSuccess();
+  auto decompressor = std::make_shared<ZlibCertificateDecompressor>();
+  auto decompressionMgr = std::make_shared<CertDecompressionManager>();
+  decompressionMgr->setDecompressors(
+      {std::static_pointer_cast<CertificateDecompressor>(decompressor)});
+  clientContext_->setCertDecompressionManager(decompressionMgr);
+  serverContext_->setSupportedCompressionAlgorithms(
+      {CertificateCompressionAlgorithm::zlib});
+  expected_.serverCertCompAlgo = CertificateCompressionAlgorithm::zlib;
+  doHandshake();
+  verifyParameters();
+  sendAppData();
 }
 
 TEST_F(HandshakeTest, EarlyDataAccepted) {
@@ -853,6 +886,26 @@ TEST_F(HandshakeTest, EarlyDataTrickleSendRejected) {
   expectServerSuccess();
   doServerHandshake();
   verifyParameters();
+}
+
+TEST_F(HandshakeTest, EarlyDataAcceptedOmitEarlyRecord) {
+  clientContext_->setSendEarlyData(true);
+  clientContext_->setOmitEarlyRecordLayer(true);
+  serverContext_->setOmitEarlyRecordLayer(true);
+  setupResume();
+
+  expected_.pskType = PskType::Resumption;
+  expected_.earlyDataType = EarlyDataType::Accepted;
+
+  expectClientSuccess();
+  doClientHandshake();
+  verifyEarlyParameters();
+
+  expectReplaySafety();
+  expectServerSuccess();
+  doServerHandshake();
+  verifyParameters();
+  sendAppData();
 }
 
 TEST_F(HandshakeTest, Compat) {

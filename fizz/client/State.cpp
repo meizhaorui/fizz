@@ -8,10 +8,9 @@
 
 #include <fizz/client/State.h>
 
-using fizz::client::ClientAuthType;
-using fizz::client::StateEnum;
 
 namespace fizz {
+namespace client {
 
 folly::StringPiece toString(StateEnum state) {
   switch (state) {
@@ -29,6 +28,10 @@ folly::StringPiece toString(StateEnum state) {
       return "ExpectingFinished";
     case StateEnum::Established:
       return "Established";
+    case StateEnum::ExpectingCloseNotify:
+      return "ExpectingCloseNotify";
+    case StateEnum::Closed:
+      return "Closed";
     case StateEnum::Error:
       return "Error";
     case StateEnum::NUM_STATES:
@@ -50,4 +53,5 @@ folly::StringPiece toString(ClientAuthType auth) {
   }
   return "Invalid client auth type";
 }
+} // namespace client
 } // namespace fizz

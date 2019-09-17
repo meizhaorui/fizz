@@ -8,9 +8,14 @@
 
 #pragma once
 
+#include <fizz/protocol/KeyScheduler.h>
+#include <fizz/protocol/Types.h>
+#include <fizz/record/RecordLayer.h>
 #include <folly/ExceptionWrapper.h>
 #include <folly/io/IOBuf.h>
 #include <folly/io/async/AsyncTransport.h>
+#include <folly/small_vector.h>
+#include <vector>
 
 namespace fizz {
 
@@ -23,10 +28,21 @@ struct DeliverAppData {
 
 /**
  * Raw data that must be written to the transport.
+ * callback: The callback that should be invoked after the write has finished.
+ *           This is usually when the kernel has accepted the buffer in the
+ *           case of TCP.
+ * contents: The TLS records that need to be written. Each TLSContent object
+ *           can represent several TLS records at a certain encryption level /
+ *           content type.
+ * flags   : The flags to use when writing the contents to the socket.
  */
 struct WriteToSocket {
   folly::AsyncTransportWrapper::WriteCallback* callback{nullptr};
-  std::unique_ptr<folly::IOBuf> data;
+#if FOLLY_MOBILE
+  std::vector<TLSContent> contents;
+#else
+  folly::small_vector<TLSContent, 4> contents;
+#endif
   folly::WriteFlags flags{folly::WriteFlags::NONE};
 };
 
@@ -38,6 +54,8 @@ struct ReportError {
 
   explicit ReportError(const std::string& errorMsg)
       : error(folly::make_exception_wrapper<std::runtime_error>(errorMsg)) {}
+
+  explicit ReportError(folly::exception_wrapper e) : error(std::move(e)) {}
 };
 
 /**
@@ -46,8 +64,31 @@ struct ReportError {
  */
 struct WaitForData {};
 
-namespace detail {
+/**
+ * New secret available. This event is triggered whenever the TLS layer derives
+ * new keys. This should not normally be used unless logging keys or not using
+ * the TLS record layer.
+ */
+struct SecretAvailable {
+  DerivedSecret secret;
+  SecretAvailable(DerivedSecret secretIn) : secret(std::move(secretIn)) {}
+};
 
+/**
+ * Reports that end of the TLS session. While the end of a TLS session
+ * typically implies the termination of a network transport, this is not
+ * mandatory, and it is possible to continue reusing the transport afterwards.
+ */
+struct EndOfData {
+  EndOfData() = default;
+  explicit EndOfData(std::unique_ptr<folly::IOBuf> postData)
+      : postTlsData(std::move(postData)) {}
+
+  // Any data we read from the connection after the end of the TLS session.
+  std::unique_ptr<folly::IOBuf> postTlsData;
+};
+
+namespace detail {
 template <typename ActionsType>
 void addAction(ActionsType& /*acts*/) {}
 

@@ -17,6 +17,8 @@
 
 namespace fizz {
 
+constexpr folly::StringPiece kHkdfLabelPrefix = "tls13 ";
+
 using Buf = std::unique_ptr<folly::IOBuf>;
 
 enum class ProtocolVersion : uint16_t {
@@ -24,12 +26,6 @@ enum class ProtocolVersion : uint16_t {
   tls_1_1 = 0x0302,
   tls_1_2 = 0x0303,
   tls_1_3 = 0x0304,
-  tls_1_3_20 = 0x7f14,
-  tls_1_3_20_fb = 0xfb14,
-  tls_1_3_21 = 0x7f15,
-  tls_1_3_21_fb = 0xfb15,
-  tls_1_3_22 = 0x7f16,
-  tls_1_3_22_fb = 0xfb16,
   tls_1_3_23 = 0x7f17,
   tls_1_3_23_fb = 0xfb17,
   tls_1_3_26 = 0x7f1a,
@@ -69,8 +65,11 @@ enum class HandshakeType : uint8_t {
   certificate_verify = 15,
   finished = 20,
   key_update = 24,
-  message_hash = 254
+  compressed_certificate = 25,
+  message_hash = 254,
 };
+
+constexpr size_t kMaxHandshakeSize = 0x20000; // 128k
 
 struct message_hash {
   static constexpr HandshakeType handshake_type = HandshakeType::message_hash;
@@ -93,8 +92,7 @@ enum class ExtensionType : uint16_t {
   signature_algorithms = 13,
   application_layer_protocol_negotiation = 16,
   token_binding = 24,
-  quic_transport_parameters = 26,
-  key_share_old = 40,
+  compress_certificate = 27,
   pre_shared_key = 41,
   early_data = 42,
   supported_versions = 43,
@@ -104,8 +102,11 @@ enum class ExtensionType : uint16_t {
   post_handshake_auth = 49,
   signature_algorithms_cert = 50,
   key_share = 51,
+  quic_transport_parameters = 0xffa5,
 
-  alternate_server_name = 0xfb00,
+  // alternate_server_name = 0xfb00,
+  test_extension = 0xff03,
+  thrift_parameters = 0xff41,
 };
 
 std::string toString(ExtensionType);
@@ -157,6 +158,14 @@ std::string toString(CipherSuite);
 enum class PskKeyExchangeMode : uint8_t { psk_ke = 0, psk_dhe_ke = 1 };
 
 std::string toString(PskKeyExchangeMode);
+
+enum class CertificateCompressionAlgorithm : uint16_t {
+  zlib = 1,
+  brotli = 2,
+  zstd = 3,
+};
+
+std::string toString(CertificateCompressionAlgorithm);
 
 struct Extension {
   ExtensionType extension_type;
@@ -225,6 +234,14 @@ struct CertificateMsg
     : HandshakeStruct<Event::Certificate, HandshakeType::certificate> {
   Buf certificate_request_context;
   std::vector<CertificateEntry> certificate_list;
+};
+
+struct CompressedCertificate : HandshakeStruct<
+                                   Event::CompressedCertificate,
+                                   HandshakeType::compressed_certificate> {
+  CertificateCompressionAlgorithm algorithm;
+  uint32_t uncompressed_length;
+  Buf compressed_certificate_message;
 };
 
 struct CertificateRequest : HandshakeStruct<
@@ -296,6 +313,13 @@ struct Alert : EventType<Event::Alert> {
   explicit Alert(AlertDescription desc) : description(desc) {}
 };
 
+struct CloseNotify : EventType<Event::CloseNotify> {
+  CloseNotify() = default;
+  explicit CloseNotify(std::unique_ptr<folly::IOBuf> data)
+      : ignoredPostCloseData(std::move(data)) {}
+  std::unique_ptr<folly::IOBuf> ignoredPostCloseData;
+};
+
 class FizzException : public std::runtime_error {
  public:
   FizzException(const std::string& msg, folly::Optional<AlertDescription> alert)
@@ -319,6 +343,8 @@ template <class T>
 T decode(folly::io::Cursor& cursor);
 template <typename T>
 std::string enumToHex(T enumValue);
+
+Buf encodeHkdfLabel(HkdfLabel&& label, const std::string& hkdfLabelPrefix);
 } // namespace fizz
 
 #include <fizz/record/Types-inl.h>

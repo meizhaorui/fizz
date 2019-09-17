@@ -16,6 +16,7 @@ namespace fizz {
 class Exporter {
  public:
   static Buf getEkm(
+      const Factory& factory,
       CipherSuite cipher,
       folly::ByteRange exporterMaster,
       folly::StringPiece label,

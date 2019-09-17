@@ -6,7 +6,7 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/crypto/exchange/ECCurveKeyExchange.h>
 #include <fizz/crypto/signature/Signature.h>
@@ -229,17 +229,20 @@ TEST_P(ECDHTest, TestKeyAgreement) {
         P256KeyExchange kex;
         kex.setPrivateKey(std::move(privateKey));
         shared = kex.generateSharedSecret(pkeyPeerKey);
-      } break;
+        break;
+      }
       case KeyType::P384: {
         P384KeyExchange kex;
         kex.setPrivateKey(std::move(privateKey));
         shared = kex.generateSharedSecret(pkeyPeerKey);
-      } break;
+        break;
+      }
       case KeyType::P521: {
         P521KeyExchange kex;
         kex.setPrivateKey(std::move(privateKey));
         shared = kex.generateSharedSecret(pkeyPeerKey);
-      } break;
+        break;
+      }
       default:
         throw std::runtime_error("unknown key type");
     }

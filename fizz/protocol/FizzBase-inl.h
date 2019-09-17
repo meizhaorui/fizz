@@ -7,9 +7,9 @@
  */
 
 #include <fizz/protocol/Exporter.h>
+#include <fizz/util/Workarounds.h>
 
 namespace fizz {
-
 template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
 void FizzBase<Derived, ActionMoveVisitor, StateMachine>::writeNewSessionTicket(
     WriteNewSessionTicket w) {
@@ -32,7 +32,13 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::earlyAppWrite(
 
 template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
 void FizzBase<Derived, ActionMoveVisitor, StateMachine>::appClose() {
-  pendingEvents_.push_back(AppClose());
+  pendingEvents_.push_back(AppClose::WAIT);
+  processPendingEvents();
+}
+
+template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
+void FizzBase<Derived, ActionMoveVisitor, StateMachine>::appCloseImmediate() {
+  pendingEvents_.push_back(AppClose::IMMEDIATE);
   processPendingEvents();
 }
 
@@ -52,12 +58,13 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::moveToErrorState(
     const folly::AsyncSocketException& ex) {
   // We use a separate flag here rather than just moving the state to Error
   // since there may be a currently processing action.
-  inErrorState_ = true;
+  externalError_ = true;
   while (!pendingEvents_.empty()) {
     auto event = std::move(pendingEvents_.front());
     pendingEvents_.pop_front();
     folly::variant_match(
         event,
+        detail::result_type<void>(),
         [&ex](AppWrite& write) {
           if (write.callback) {
             write.callback->writeErr(0, ex);
@@ -74,7 +81,14 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::moveToErrorState(
 
 template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
 bool FizzBase<Derived, ActionMoveVisitor, StateMachine>::inErrorState() const {
-  return inErrorState_ || state_.state() == decltype(state_.state())::Error;
+  return state_.state() == decltype(state_.state())::Error;
+}
+
+template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
+bool FizzBase<Derived, ActionMoveVisitor, StateMachine>::inTerminalState()
+    const {
+  return inErrorState() || externalError_ ||
+      state_.state() == decltype(state_.state())::Closed;
 }
 
 template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
@@ -123,7 +137,7 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::
     inProcessPendingEvents_ = false;
   };
 
-  while (!actionGuard_ && !inErrorState()) {
+  while (!actionGuard_ && !inTerminalState()) {
     folly::Optional<typename StateMachine::ProcessingActions> actions;
     actionGuard_ = folly::DelayedDestruction::DestructorGuard(owner_);
     if (!waitForData_) {
@@ -133,6 +147,7 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::
       pendingEvents_.pop_front();
       folly::variant_match(
           event,
+          detail::result_type<void>(),
           [&actions, this](WriteNewSessionTicket& write) {
             actions =
                 machine_.processWriteNewSessionTicket(state_, std::move(write));
@@ -143,8 +158,12 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::
           [&actions, this](EarlyAppWrite& write) {
             actions = machine_.processEarlyAppWrite(state_, std::move(write));
           },
-          [&actions, this](AppClose&) {
-            actions = machine_.processAppClose(state_);
+          [&actions, this](AppClose& close) {
+            if (close.policy == AppClose::WAIT) {
+              actions = machine_.processAppClose(state_);
+            } else {
+              actions = machine_.processAppCloseImmediate(state_);
+            }
           });
     } else {
       actionGuard_.clear();
@@ -157,10 +176,12 @@ void FizzBase<Derived, ActionMoveVisitor, StateMachine>::
 
 template <typename Derived, typename ActionMoveVisitor, typename StateMachine>
 Buf FizzBase<Derived, ActionMoveVisitor, StateMachine>::getEkm(
+    const Factory& factory,
     folly::StringPiece label,
     const Buf& context,
     uint16_t length) const {
   return Exporter::getEkm(
+      factory,
       *state_.cipher(),
       (*state_.exporterMasterSecret())->coalesce(),
       label,

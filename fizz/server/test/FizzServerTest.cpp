@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/server/FizzServer.h>
 #include <fizz/server/test/Mocks.h>
@@ -135,6 +135,12 @@ TEST_F(FizzServerTest, TestSSLV2AfterData) {
         return AsyncActions(Actions());
       }));
   fizzServer_->fizzServer_.newTransportData();
+}
+
+TEST(FizzServerContextTest, TestCopy) {
+  FizzServerContext ctx;
+  auto ctx2 = ctx;
+  (void) ctx2;
 }
 } // namespace test
 } // namespace server

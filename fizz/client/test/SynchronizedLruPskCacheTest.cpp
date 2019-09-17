@@ -6,14 +6,13 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/client/SynchronizedLruPskCache.h>
 #include <fizz/client/test/Utilities.h>
 #include <folly/Format.h>
 
-using namespace folly;
 using namespace testing;
 
 namespace fizz {

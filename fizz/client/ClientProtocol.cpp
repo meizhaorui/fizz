@@ -9,6 +9,7 @@
 #include <fizz/client/ClientProtocol.h>
 
 #include <fizz/client/PskCache.h>
+#include <fizz/client/State.h>
 #include <fizz/crypto/Utils.h>
 #include <fizz/protocol/CertificateVerifier.h>
 #include <fizz/protocol/Protocol.h>
@@ -75,6 +76,12 @@ FIZZ_DECLARE_EVENT_HANDLER(
 FIZZ_DECLARE_EVENT_HANDLER(
     ClientTypes,
     StateEnum::ExpectingCertificate,
+    Event::CompressedCertificate,
+    StateEnum::ExpectingCertificateVerify);
+
+FIZZ_DECLARE_EVENT_HANDLER(
+    ClientTypes,
+    StateEnum::ExpectingCertificate,
     Event::EarlyAppWrite,
     StateEnum::Error);
 
@@ -131,6 +138,18 @@ FIZZ_DECLARE_EVENT_HANDLER(
     StateEnum::Established,
     Event::KeyUpdate,
     StateEnum::Error);
+
+FIZZ_DECLARE_EVENT_HANDLER(
+    ClientTypes,
+    StateEnum::Established,
+    Event::CloseNotify,
+    StateEnum::Closed);
+
+FIZZ_DECLARE_EVENT_HANDLER(
+    ClientTypes,
+    StateEnum::ExpectingCloseNotify,
+    Event::CloseNotify,
+    StateEnum::Closed);
 } // namespace sm
 
 namespace client {
@@ -158,7 +177,7 @@ Actions ClientStateMachine::processSocketData(
     if (!state.readRecordLayer()) {
       return detail::handleError(
           state,
-          "attempting to process data without record layer",
+          ReportError("attempting to process data without record layer"),
           folly::none);
     }
     auto param = state.readRecordLayer()->readEvent(buf);
@@ -166,8 +185,22 @@ Actions ClientStateMachine::processSocketData(
       return actions(WaitForData());
     }
     return detail::processEvent(state, std::move(*param));
+  } catch (const FizzException& e) {
+    return detail::handleError(
+        state,
+        ReportError(folly::exception_wrapper(std::current_exception(), e)),
+        e.getAlert());
   } catch (const std::exception& e) {
-    return detail::handleError(state, e.what(), AlertDescription::decode_error);
+    return detail::handleError(
+        state,
+        ReportError(folly::make_exception_wrapper<FizzException>(
+            folly::to<std::string>(
+                "error decoding record in state ",
+                toString(state.state()),
+                ": ",
+                e.what()),
+            AlertDescription::decode_error)),
+        AlertDescription::decode_error);
   }
 }
 
@@ -193,6 +226,10 @@ Actions ClientStateMachine::processAppClose(const State& state) {
   return detail::handleAppClose(state);
 }
 
+Actions ClientStateMachine::processAppCloseImmediate(const State& state) {
+  return detail::handleAppCloseImmediate(state);
+}
+
 namespace detail {
 
 Actions processEvent(const State& state, Param param) {
@@ -201,18 +238,22 @@ Actions processEvent(const State& state, Param param) {
     return sm::StateMachine<ClientTypes>::getHandler(state.state(), event)(
         state, std::move(param));
   } catch (const FizzException& e) {
-    return detail::handleError(state, e.what(), e.getAlert());
+    return detail::handleError(
+        state,
+        ReportError(folly::exception_wrapper(std::current_exception(), e)),
+        e.getAlert());
   } catch (const std::exception& e) {
     return detail::handleError(
-        state, e.what(), AlertDescription::unexpected_message);
+        state,
+        ReportError(folly::exception_wrapper(std::current_exception(), e)),
+        AlertDescription::unexpected_message);
   }
 }
 
 Actions handleError(
     const State& state,
-    const std::string& errorMsg,
+    ReportError error,
     Optional<AlertDescription> alertDesc) {
-  ReportError error(errorMsg);
   if (state.state() == StateEnum::Error) {
     return actions(std::move(error));
   }
@@ -224,25 +265,49 @@ Actions handleError(
   if (alertDesc && state.writeRecordLayer()) {
     Alert alert(*alertDesc);
     WriteToSocket write;
-    write.data = state.writeRecordLayer()->writeAlert(std::move(alert));
+    write.contents.emplace_back(
+        state.writeRecordLayer()->writeAlert(std::move(alert)));
     return actions(std::move(transition), std::move(write), std::move(error));
   } else {
     return actions(std::move(transition), std::move(error));
   }
 }
 
-Actions handleAppClose(const State& state) {
+Actions handleAppCloseImmediate(const State& state) {
   auto transition = [](State& newState) {
-    newState.state() = StateEnum::Error;
+    newState.state() = StateEnum::Closed;
     newState.writeRecordLayer() = nullptr;
     newState.readRecordLayer() = nullptr;
   };
   if (state.writeRecordLayer()) {
     Alert alert(AlertDescription::close_notify);
     WriteToSocket write;
-    write.data = state.writeRecordLayer()->writeAlert(std::move(alert));
+    write.contents.emplace_back(
+        state.writeRecordLayer()->writeAlert(std::move(alert)));
     return actions(std::move(transition), std::move(write));
   } else {
+    return actions(std::move(transition));
+  }
+}
+
+Actions handleAppClose(const State& state) {
+  if (state.writeRecordLayer()) {
+    auto transition = [](State& newState) {
+      newState.state() = StateEnum::ExpectingCloseNotify;
+      newState.writeRecordLayer() = nullptr;
+    };
+
+    Alert alert(AlertDescription::close_notify);
+    WriteToSocket write;
+    write.contents.emplace_back(
+        state.writeRecordLayer()->writeAlert(std::move(alert)));
+    return actions(std::move(transition), std::move(write));
+  } else {
+    auto transition = [](State& newState) {
+      newState.state() = StateEnum::Closed;
+      newState.writeRecordLayer() = nullptr;
+      newState.readRecordLayer() = nullptr;
+    };
     return actions(std::move(transition));
   }
 }
@@ -267,20 +332,28 @@ Actions handleInvalidEvent(const State& state, Event event, Param param) {
         AlertDescription::unexpected_message);
   }
 }
+
 } // namespace detail
 } // namespace client
 
 namespace sm {
 
+static void ensureNoUnparsedHandshakeData(const State& state, Event event) {
+  if (state.readRecordLayer()->hasUnparsedHandshakeData()) {
+    throw FizzException(
+        folly::to<std::string>(
+            "unprocessed handshake data while handling event ",
+            toString(event),
+            " in state ",
+            toString(state.state())),
+        AlertDescription::unexpected_message);
+  }
+}
+
 static folly::Optional<CachedPsk> validatePsk(
     const FizzClientContext& context,
     folly::Optional<CachedPsk> psk) {
   if (!psk) {
-    return folly::none;
-  }
-
-  if (std::chrono::system_clock::now() > psk->ticketExpirationTime) {
-    VLOG(1) << "Ignoring expired cached psk";
     return folly::none;
   }
 
@@ -298,6 +371,24 @@ static folly::Optional<CachedPsk> validatePsk(
           psk->cipher) == context.getSupportedCiphers().end()) {
     VLOG(1) << "Ignoring cached psk with cipher " << toString(psk->cipher);
     return folly::none;
+  }
+
+  // The below checks apply only to resumption tickets
+  if (psk->type == PskType::Resumption) {
+    auto now = context.getClock()->getCurrentTime();
+    if (now > psk->ticketExpirationTime) {
+      VLOG(1) << "Ignoring expired cached psk";
+      return folly::none;
+    }
+    if (now - psk->ticketHandshakeTime > context.getMaxPskHandshakeLife()) {
+      VLOG(1) << "Ignoring psk with stale handshake";
+      return folly::none;
+    }
+
+    if (psk->ticketHandshakeTime > now) {
+      VLOG(1) << "Ignoring psk from future";
+      return folly::none;
+    }
   }
 
   return psk;
@@ -318,7 +409,6 @@ static std::map<NamedGroup, std::unique_ptr<KeyExchange>> getKeyExchangers(
 static ClientHello getClientHello(
     const Factory& /*factory*/,
     const Random& random,
-    bool alternateSniCodePoint,
     const std::vector<CipherSuite>& supportedCiphers,
     const std::vector<ProtocolVersion>& supportedVersions,
     const std::vector<NamedGroup>& supportedGroups,
@@ -327,6 +417,7 @@ static ClientHello getClientHello(
     const std::vector<PskKeyExchangeMode>& supportedPskModes,
     const folly::Optional<std::string>& hostname,
     const std::vector<std::string>& supportedAlpns,
+    const std::vector<CertificateCompressionAlgorithm>& compressionAlgos,
     const Optional<EarlyDataParams>& earlyDataParams,
     const Buf& legacySessionId,
     ClientExtensions* extensions,
@@ -364,7 +455,6 @@ static ClientHello getClientHello(
     ServerName sn;
     sn.hostname = folly::IOBuf::copyBuffer(*hostname);
     sni.server_name_list.push_back(std::move(sn));
-    sni.useAlternateCodePoint = alternateSniCodePoint;
     chlo.extensions.push_back(encodeExtension(std::move(sni)));
   }
 
@@ -394,6 +484,12 @@ static ClientHello getClientHello(
     chlo.extensions.push_back(encodeExtension(std::move(monster)));
   }
 
+  if (!compressionAlgos.empty()) {
+    CertificateCompressionAlgorithms algos;
+    algos.algorithms = compressionAlgos;
+    chlo.extensions.push_back(encodeExtension(std::move(algos)));
+  }
+
   if (extensions) {
     auto additionalExtensions = extensions->getClientHelloExtensions();
     for (auto& ext : additionalExtensions) {
@@ -404,15 +500,21 @@ static ClientHello getClientHello(
   return chlo;
 }
 
-static ClientPresharedKey getPskExtension(const CachedPsk& psk) {
+static ClientPresharedKey getPskExtension(
+    const CachedPsk& psk,
+    const Clock& clock) {
   ClientPresharedKey pskExt;
   PskIdentity ident;
   ident.psk_identity = folly::IOBuf::copyBuffer(psk.psk);
-  ident.obfuscated_ticket_age =
-      std::chrono::duration_cast<std::chrono::milliseconds>(
-          std::chrono::system_clock::now() - psk.ticketIssueTime)
-          .count();
-  ident.obfuscated_ticket_age += psk.ticketAgeAdd;
+  if (psk.type == PskType::Resumption) {
+    ident.obfuscated_ticket_age =
+        std::chrono::duration_cast<std::chrono::milliseconds>(
+            clock.getCurrentTime() - psk.ticketIssueTime)
+            .count();
+    ident.obfuscated_ticket_age += psk.ticketAgeAdd;
+  } else {
+    ident.obfuscated_ticket_age = 0;
+  }
   pskExt.identities.push_back(std::move(ident));
   PskBinder binder;
   size_t binderSize = getHashSize(getHashFunction(psk.cipher));
@@ -433,7 +535,8 @@ static Buf encodeAndAddBinders(
     ClientHello chlo,
     const CachedPsk& psk,
     KeyScheduler& scheduler,
-    HandshakeContext& handshakeContext) {
+    HandshakeContext& handshakeContext,
+    const Clock& clock) {
   scheduler.deriveEarlySecret(folly::range(psk.secret));
 
   auto binderKey = scheduler.getSecret(
@@ -441,7 +544,7 @@ static Buf encodeAndAddBinders(
                                     : EarlySecrets::ResumptionPskBinder,
       handshakeContext.getBlankContext());
 
-  auto pskExt = getPskExtension(psk);
+  auto pskExt = getPskExtension(psk, clock);
   chlo.extensions.push_back(encodeExtension(pskExt));
 
   size_t binderLength = getBinderLength(chlo);
@@ -457,7 +560,8 @@ static Buf encodeAndAddBinders(
   }
 
   PskBinder binder;
-  binder.binder = handshakeContext.getFinishedData(folly::range(binderKey));
+  binder.binder =
+      handshakeContext.getFinishedData(folly::range(binderKey.secret));
   pskExt.binders.clear();
   pskExt.binders.push_back(std::move(binder));
 
@@ -500,7 +604,7 @@ static Optional<EarlyDataParams> getEarlyDataParams(
   params.serverCert = psk->serverCert;
   params.clientCert = psk->clientCert;
   params.alpn = psk->alpn;
-  return std::move(params);
+  return params;
 }
 
 Actions
@@ -548,7 +652,6 @@ EventHandler<ClientTypes, StateEnum::Uninitialized, Event::Connect>::handle(
   auto chlo = getClientHello(
       *context->getFactory(),
       random,
-      context->getUseAlternateSniCodePoint(),
       context->getSupportedCiphers(),
       context->getSupportedVersions(),
       context->getSupportedGroups(),
@@ -557,6 +660,7 @@ EventHandler<ClientTypes, StateEnum::Uninitialized, Event::Connect>::handle(
       context->getSupportedPskModes(),
       connect.sni,
       context->getSupportedAlpns(),
+      context->getSupportedCertDecompressionAlgorithms(),
       earlyDataParams,
       legacySessionId,
       connect.extensions.get());
@@ -569,6 +673,7 @@ EventHandler<ClientTypes, StateEnum::Uninitialized, Event::Connect>::handle(
   Buf encodedClientHello;
   std::unique_ptr<EncryptedWriteRecordLayer> earlyWriteRecordLayer;
   Optional<ReportEarlyHandshakeSuccess> reportEarlySuccess;
+  Optional<SecretAvailable> earlyWriteSecretAvailable;
   if (psk) {
     requestedExtensions.push_back(ExtensionType::pre_shared_key);
     auto keyScheduler = context->getFactory()->makeKeyScheduler(psk->cipher);
@@ -576,27 +681,35 @@ EventHandler<ClientTypes, StateEnum::Uninitialized, Event::Connect>::handle(
         context->getFactory()->makeHandshakeContext(psk->cipher);
 
     encodedClientHello = encodeAndAddBinders(
-        std::move(chlo), *psk, *keyScheduler, *handshakeContext);
+        std::move(chlo),
+        *psk,
+        *keyScheduler,
+        *handshakeContext,
+        *context->getClock());
 
     if (earlyDataParams) {
-      earlyWriteRecordLayer =
-          context->getFactory()->makeEncryptedWriteRecordLayer();
-      earlyWriteRecordLayer->setProtocolVersion(psk->version);
       auto earlyWriteSecret = keyScheduler->getSecret(
           EarlySecrets::ClientEarlyTraffic,
           handshakeContext->getHandshakeContext()->coalesce());
-      Protocol::setAead(
-          *earlyWriteRecordLayer,
-          psk->cipher,
-          folly::range(earlyWriteSecret),
-          *context->getFactory(),
-          *keyScheduler);
+      if (!context->getOmitEarlyRecordLayer()) {
+        earlyWriteRecordLayer =
+            context->getFactory()->makeEncryptedWriteRecordLayer(
+                EncryptionLevel::EarlyData);
+        earlyWriteRecordLayer->setProtocolVersion(psk->version);
+        Protocol::setAead(
+            *earlyWriteRecordLayer,
+            psk->cipher,
+            folly::range(earlyWriteSecret.secret),
+            *context->getFactory(),
+            *keyScheduler);
+      }
+      earlyWriteSecretAvailable = SecretAvailable(std::move(earlyWriteSecret));
 
       auto earlyExporterVector = keyScheduler->getSecret(
           EarlySecrets::EarlyExporter,
           handshakeContext->getHandshakeContext()->coalesce());
       earlyDataParams->earlyExporterSecret =
-          folly::IOBuf::copyBuffer(folly::range(earlyExporterVector));
+          folly::IOBuf::copyBuffer(folly::range(earlyExporterVector.secret));
 
       reportEarlySuccess = ReportEarlyHandshakeSuccess();
       reportEarlySuccess->maxEarlyDataSize = psk->maxEarlyDataSize;
@@ -610,8 +723,8 @@ EventHandler<ClientTypes, StateEnum::Uninitialized, Event::Connect>::handle(
       context->getFactory()->makePlaintextWriteRecordLayer();
 
   WriteToSocket write;
-  write.data =
-      writeRecordLayer->writeInitialClientHello(encodedClientHello->clone());
+  write.contents.emplace_back(
+      writeRecordLayer->writeInitialClientHello(encodedClientHello->clone()));
 
   EarlyDataType earlyDataType =
       earlyDataParams ? EarlyDataType::Attempted : EarlyDataType::NotAttempted;
@@ -654,6 +767,7 @@ EventHandler<ClientTypes, StateEnum::Uninitialized, Event::Connect>::handle(
           newState.earlyWriteRecordLayer() = std::move(earlyWriteRecordLayer);
         },
         std::move(write),
+        std::move(*earlyWriteSecretAvailable),
         std::move(*reportEarlySuccess),
         &Transition<StateEnum::ExpectingServerHello>);
   } else {
@@ -903,7 +1017,8 @@ EventHandler<ClientTypes, StateEnum::ExpectingServerHello, Event::ServerHello>::
   }
 
   auto handshakeWriteRecordLayer =
-      state.context()->getFactory()->makeEncryptedWriteRecordLayer();
+      state.context()->getFactory()->makeEncryptedWriteRecordLayer(
+          EncryptionLevel::Handshake);
   handshakeWriteRecordLayer->setProtocolVersion(version);
   auto handshakeWriteSecret = scheduler->getSecret(
       HandshakeSecrets::ClientHandshakeTraffic,
@@ -911,12 +1026,13 @@ EventHandler<ClientTypes, StateEnum::ExpectingServerHello, Event::ServerHello>::
   Protocol::setAead(
       *handshakeWriteRecordLayer,
       cipher,
-      folly::range(handshakeWriteSecret),
+      folly::range(handshakeWriteSecret.secret),
       *state.context()->getFactory(),
       *scheduler);
 
   auto handshakeReadRecordLayer =
-      state.context()->getFactory()->makeEncryptedReadRecordLayer();
+      state.context()->getFactory()->makeEncryptedReadRecordLayer(
+          EncryptionLevel::Handshake);
   handshakeReadRecordLayer->setProtocolVersion(version);
   auto handshakeReadSecret = scheduler->getSecret(
       HandshakeSecrets::ServerHandshakeTraffic,
@@ -924,20 +1040,27 @@ EventHandler<ClientTypes, StateEnum::ExpectingServerHello, Event::ServerHello>::
   Protocol::setAead(
       *handshakeReadRecordLayer,
       cipher,
-      folly::range(handshakeReadSecret),
+      folly::range(handshakeReadSecret.secret),
       *state.context()->getFactory(),
       *scheduler);
 
   auto clientHandshakeSecret =
-      folly::IOBuf::copyBuffer(folly::range(handshakeWriteSecret));
+      folly::IOBuf::copyBuffer(folly::range(handshakeWriteSecret.secret));
   auto serverHandshakeSecret =
-      folly::IOBuf::copyBuffer(folly::range(handshakeReadSecret));
+      folly::IOBuf::copyBuffer(folly::range(handshakeReadSecret.secret));
 
   folly::Optional<ClientAuthType> authType;
   if (negotiatedPsk.clientCert) {
     authType = ClientAuthType::Stored;
   } else if (negotiatedPsk.serverCert) {
     authType = ClientAuthType::NotRequested;
+  }
+
+  std::chrono::system_clock::time_point handshakeTime;
+  if (negotiatedPsk.mode) {
+    handshakeTime = state.attemptedPsk()->ticketHandshakeTime;
+  } else {
+    handshakeTime = state.context()->getClock()->getCurrentTime();
   }
 
   return actions(
@@ -955,7 +1078,8 @@ EventHandler<ClientTypes, StateEnum::ExpectingServerHello, Event::ServerHello>::
        pskMode = negotiatedPsk.mode,
        serverCert = std::move(negotiatedPsk.serverCert),
        clientCert = std::move(negotiatedPsk.clientCert),
-       authType = std::move(authType)](State& newState) mutable {
+       authType = std::move(authType),
+       handshakeTime = std::move(handshakeTime)](State& newState) mutable {
         newState.keyScheduler() = std::move(keyScheduler);
         newState.readRecordLayer() = std::move(readRecordLayer);
         newState.writeRecordLayer() = std::move(writeRecordLayer);
@@ -973,7 +1097,10 @@ EventHandler<ClientTypes, StateEnum::ExpectingServerHello, Event::ServerHello>::
         newState.serverCert() = std::move(serverCert);
         newState.clientCert() = std::move(clientCert);
         newState.clientAuthRequested() = std::move(authType);
+        newState.handshakeTime() = std::move(handshakeTime);
       },
+      SecretAvailable(std::move(handshakeReadSecret)),
+      SecretAvailable(std::move(handshakeWriteSecret)),
       &Transition<StateEnum::ExpectingEncryptedExtensions>);
 }
 
@@ -1064,7 +1191,6 @@ Actions EventHandler<
   auto chlo = getClientHello(
       *state.context()->getFactory(),
       state.clientRandom(),
-      state.context()->getUseAlternateSniCodePoint(),
       state.context()->getSupportedCiphers(),
       state.context()->getSupportedVersions(),
       state.context()->getSupportedGroups(),
@@ -1073,6 +1199,7 @@ Actions EventHandler<
       state.context()->getSupportedPskModes(),
       state.sni(),
       state.context()->getSupportedAlpns(),
+      state.context()->getSupportedCertDecompressionAlgorithms(),
       folly::none,
       state.legacySessionId(),
       state.extensions(),
@@ -1101,7 +1228,11 @@ Actions EventHandler<
     auto keyScheduler = state.context()->getFactory()->makeKeyScheduler(cipher);
 
     encodedClientHello = encodeAndAddBinders(
-        std::move(chlo), *attemptedPsk, *keyScheduler, *handshakeContext);
+        std::move(chlo),
+        *attemptedPsk,
+        *keyScheduler,
+        *handshakeContext,
+        *state.context()->getClock());
   } else {
     encodedClientHello = encodeHandshake(std::move(chlo));
     handshakeContext->appendToTranscript(encodedClientHello);
@@ -1111,17 +1242,21 @@ Actions EventHandler<
       ? EarlyDataType::Rejected
       : state.earlyDataType();
 
-  WriteToSocket write;
-  write.data =
+  WriteToSocket clientFlight;
+  auto chloWrite =
       state.writeRecordLayer()->writeHandshake(encodedClientHello->clone());
 
   bool sentCCS = state.sentCCS();
+  folly::Optional<client::Action> ccsWrite;
   if (state.context()->getCompatibilityMode() && !sentCCS) {
-    auto fakeCCS = folly::IOBuf::wrapBuffer(FakeChangeCipherSpec);
-    fakeCCS->prependChain(std::move(write.data));
-    write.data = std::move(fakeCCS);
+    TLSContent writeCCS;
+    writeCCS.data = folly::IOBuf::wrapBuffer(FakeChangeCipherSpec);
+    writeCCS.contentType = ContentType::change_cipher_spec;
+    writeCCS.encryptionLevel = EncryptionLevel::Plaintext;
+    clientFlight.contents.emplace_back(std::move(writeCCS));
     sentCCS = true;
   }
+  clientFlight.contents.emplace_back(std::move(chloWrite));
 
   return actions(
       [version,
@@ -1145,7 +1280,7 @@ Actions EventHandler<
         newState.requestedExtensions() = std::move(requestedExtensions);
         newState.sentCCS() = sentCCS;
       },
-      std::move(write),
+      std::move(clientFlight),
       &Transition<StateEnum::ExpectingServerHello>);
 }
 
@@ -1172,7 +1307,8 @@ static void validateAcceptedEarly(
         AlertDescription::illegal_parameter);
   }
 
-  if (!state.earlyWriteRecordLayer()) {
+  if (!state.earlyWriteRecordLayer() &&
+      !state.context()->getOmitEarlyRecordLayer()) {
     throw FizzException(
         "no early record layer", AlertDescription::illegal_parameter);
   }
@@ -1236,7 +1372,8 @@ Actions EventHandler<
     newState.earlyDataType() = earlyDataType;
   };
 
-  if (state.serverCert() != nullptr) {
+  if (state.pskType() == PskType::Resumption ||
+      state.pskType() == PskType::External) {
     return actions(
         std::move(mutateState), &Transition<StateEnum::ExpectingFinished>);
   } else {
@@ -1323,13 +1460,10 @@ Actions EventHandler<
       std::move(mutateState), &Transition<StateEnum::ExpectingCertificate>);
 }
 
-Actions
-EventHandler<ClientTypes, StateEnum::ExpectingCertificate, Event::Certificate>::
-    handle(const State& state, Param param) {
-  auto certMsg = std::move(boost::get<CertificateMsg>(param));
-
-  state.handshakeContext()->appendToTranscript(*certMsg.originalEncoding);
-
+static MutateState handleCertMsg(
+    const State& state,
+    CertificateMsg certMsg,
+    folly::Optional<CertificateCompressionAlgorithm> algo) {
   if (!certMsg.certificate_request_context->empty()) {
     throw FizzException(
         "certificate request context must be empty",
@@ -1357,12 +1491,64 @@ EventHandler<ClientTypes, StateEnum::ExpectingCertificate, Event::Certificate>::
   ClientAuthType authType =
       state.clientAuthRequested().value_or(ClientAuthType::NotRequested);
 
+  return [unverifiedCertChain = std::move(serverCerts),
+          authType,
+          compAlgo = std::move(algo)](State& newState) mutable {
+    newState.unverifiedCertChain() = std::move(unverifiedCertChain);
+    newState.clientAuthRequested() = authType;
+    newState.serverCertCompAlgo() = std::move(compAlgo);
+  };
+}
+
+Actions EventHandler<
+    ClientTypes,
+    StateEnum::ExpectingCertificate,
+    Event::CompressedCertificate>::handle(const State& state, Param param) {
+  if (state.context()->getSupportedCertDecompressionAlgorithms().empty()) {
+    throw FizzException(
+        "compressed certificate received unexpectedly",
+        AlertDescription::unexpected_message);
+  }
+
+  auto compCert = std::move(boost::get<CompressedCertificate>(param));
+  state.handshakeContext()->appendToTranscript(*compCert.originalEncoding);
+
+  auto algos = state.context()->getSupportedCertDecompressionAlgorithms();
+  if (std::find(algos.begin(), algos.end(), compCert.algorithm) ==
+      algos.end()) {
+    throw FizzException(
+        "certificate compressed with unsupported algorithm: " +
+            toString(compCert.algorithm),
+        AlertDescription::bad_certificate);
+  }
+
+  auto decompressor =
+      state.context()->getCertDecompressorForAlgorithm(compCert.algorithm);
+  DCHECK(decompressor);
+
+  CertificateMsg msg;
+  try {
+    msg = decompressor->decompress(compCert);
+  } catch (const std::exception& e) {
+    throw FizzException(
+        folly::to<std::string>("certificate decompression failed: ", e.what()),
+        AlertDescription::bad_certificate);
+  }
+
   return actions(
-      [unverifiedCertChain = std::move(serverCerts),
-       authType](State& newState) mutable {
-        newState.unverifiedCertChain() = std::move(unverifiedCertChain);
-        newState.clientAuthRequested() = authType;
-      },
+      handleCertMsg(state, std::move(msg), compCert.algorithm),
+      &Transition<StateEnum::ExpectingCertificateVerify>);
+}
+
+Actions
+EventHandler<ClientTypes, StateEnum::ExpectingCertificate, Event::Certificate>::
+    handle(const State& state, Param param) {
+  auto certMsg = std::move(boost::get<CertificateMsg>(param));
+
+  state.handshakeContext()->appendToTranscript(*certMsg.originalEncoding);
+
+  return actions(
+      handleCertMsg(state, std::move(certMsg), folly::none),
       &Transition<StateEnum::ExpectingCertificateVerify>);
 }
 
@@ -1399,7 +1585,7 @@ Actions EventHandler<
     } catch (const FizzException&) {
       std::rethrow_exception(std::current_exception());
     } catch (const std::exception& e) {
-      throw FizzException(
+      throw FizzVerificationException(
           folly::to<std::string>("verifier failure: ", e.what()),
           AlertDescription::bad_certificate);
     }
@@ -1439,12 +1625,13 @@ EventHandler<ClientTypes, StateEnum::ExpectingFinished, Event::Finished>::
   auto clientFinishedContext = state.handshakeContext()->getHandshakeContext();
   state.keyScheduler()->deriveMasterSecret();
 
-  Buf writtenEndOfEarly;
-  if (state.earlyDataType() == EarlyDataType::Accepted) {
+  folly::Optional<TLSContent> eoedWrite;
+  if (state.earlyDataType() == EarlyDataType::Accepted &&
+      !state.context()->getOmitEarlyRecordLayer()) {
     auto encodedEndOfEarly = encodeHandshake(EndOfEarlyData());
     state.handshakeContext()->appendToTranscript(encodedEndOfEarly);
     DCHECK(state.earlyWriteRecordLayer());
-    writtenEndOfEarly = state.earlyWriteRecordLayer()->writeHandshake(
+    eoedWrite = state.earlyWriteRecordLayer()->writeHandshake(
         std::move(encodedEndOfEarly));
   }
 
@@ -1486,40 +1673,44 @@ EventHandler<ClientTypes, StateEnum::ExpectingFinished, Event::Finished>::
   auto exporterMasterVector = state.keyScheduler()->getSecret(
       MasterSecrets::ExporterMaster, clientFinishedContext->coalesce());
   auto exporterMaster =
-      folly::IOBuf::copyBuffer(folly::range(exporterMasterVector));
+      folly::IOBuf::copyBuffer(folly::range(exporterMasterVector.secret));
 
   auto encodedFinished = Protocol::getFinished(
       state.clientHandshakeSecret()->coalesce(), *state.handshakeContext());
-  auto resumptionSecret =
-      folly::IOBuf::copyBuffer(folly::range(state.keyScheduler()->getSecret(
-          MasterSecrets::ResumptionMaster,
-          state.handshakeContext()->getHandshakeContext()->coalesce())));
+  auto resumptionSecret = folly::IOBuf::copyBuffer(folly::range(
+      state.keyScheduler()
+          ->getSecret(
+              MasterSecrets::ResumptionMaster,
+              state.handshakeContext()->getHandshakeContext()->coalesce())
+          .secret));
 
-  WriteToSocket write;
-  if (auth == ClientAuthType::RequestedNoMatch) {
-    write.data = state.writeRecordLayer()->writeHandshake(
-        std::move(*encodedCertMessage), std::move(encodedFinished));
-  } else if (auth == ClientAuthType::Sent) {
-    write.data = state.writeRecordLayer()->writeHandshake(
-        std::move(*encodedCertMessage),
-        std::move(*encodedCertVerify),
-        std::move(encodedFinished));
-  } else {
-    write.data =
-        state.writeRecordLayer()->writeHandshake(std::move(encodedFinished));
-  }
-
-  if (writtenEndOfEarly) {
-    writtenEndOfEarly->prependChain(std::move(write.data));
-    write.data = std::move(writtenEndOfEarly);
-  }
+  WriteToSocket clientFlight;
 
   bool sentCCS = state.sentCCS();
   if (state.context()->getCompatibilityMode() && !sentCCS) {
-    auto fakeCCS = folly::IOBuf::wrapBuffer(FakeChangeCipherSpec);
-    fakeCCS->prependChain(std::move(write.data));
-    write.data = std::move(fakeCCS);
+    TLSContent writeCCS;
+    writeCCS.encryptionLevel = EncryptionLevel::Plaintext;
+    writeCCS.contentType = ContentType::change_cipher_spec;
+    writeCCS.data = folly::IOBuf::wrapBuffer(FakeChangeCipherSpec);
+    clientFlight.contents.emplace_back(std::move(writeCCS));
     sentCCS = true;
+  }
+
+  if (eoedWrite) {
+    clientFlight.contents.emplace_back(std::move(*eoedWrite));
+  }
+
+  if (auth == ClientAuthType::RequestedNoMatch) {
+    clientFlight.contents.emplace_back(state.writeRecordLayer()->writeHandshake(
+        std::move(*encodedCertMessage), std::move(encodedFinished)));
+  } else if (auth == ClientAuthType::Sent) {
+    clientFlight.contents.emplace_back(state.writeRecordLayer()->writeHandshake(
+        std::move(*encodedCertMessage),
+        std::move(*encodedCertVerify),
+        std::move(encodedFinished)));
+  } else {
+    clientFlight.contents.emplace_back(
+        state.writeRecordLayer()->writeHandshake(std::move(encodedFinished)));
   }
 
   state.keyScheduler()->deriveAppTrafficSecrets(
@@ -1527,26 +1718,28 @@ EventHandler<ClientTypes, StateEnum::ExpectingFinished, Event::Finished>::
   state.keyScheduler()->clearMasterSecret();
 
   auto writeRecordLayer =
-      state.context()->getFactory()->makeEncryptedWriteRecordLayer();
+      state.context()->getFactory()->makeEncryptedWriteRecordLayer(
+          EncryptionLevel::AppTraffic);
   writeRecordLayer->setProtocolVersion(*state.version());
   auto writeSecret =
       state.keyScheduler()->getSecret(AppTrafficSecrets::ClientAppTraffic);
   Protocol::setAead(
       *writeRecordLayer,
       *state.cipher(),
-      folly::range(writeSecret),
+      folly::range(writeSecret.secret),
       *state.context()->getFactory(),
       *state.keyScheduler());
 
   auto readRecordLayer =
-      state.context()->getFactory()->makeEncryptedReadRecordLayer();
+      state.context()->getFactory()->makeEncryptedReadRecordLayer(
+          EncryptionLevel::AppTraffic);
   readRecordLayer->setProtocolVersion(*state.version());
   auto readSecret =
       state.keyScheduler()->getSecret(AppTrafficSecrets::ServerAppTraffic);
   Protocol::setAead(
       *readRecordLayer,
       *state.cipher(),
-      folly::range(readSecret),
+      folly::range(readSecret.secret),
       *state.context()->getFactory(),
       *state.keyScheduler());
 
@@ -1573,7 +1766,9 @@ EventHandler<ClientTypes, StateEnum::ExpectingFinished, Event::Finished>::
         newState.sentCCS() = sentCCS;
       },
       &Transition<StateEnum::Established>,
-      std::move(write),
+      SecretAvailable(std::move(readSecret)),
+      SecretAvailable(std::move(writeSecret)),
+      std::move(clientFlight),
       std::move(reportSuccess));
 }
 
@@ -1608,9 +1803,12 @@ EventHandler<ClientTypes, StateEnum::Established, Event::NewSessionTicket>::
   newCachedPsk.psk.clientCert = state.clientCert();
   newCachedPsk.psk.alpn = state.alpn();
   newCachedPsk.psk.ticketAgeAdd = nst.ticket_age_add;
-  newCachedPsk.psk.ticketIssueTime = std::chrono::system_clock::now();
-  newCachedPsk.psk.ticketExpirationTime = std::chrono::system_clock::now() +
+  newCachedPsk.psk.ticketIssueTime =
+      state.context()->getClock()->getCurrentTime();
+  newCachedPsk.psk.ticketExpirationTime =
+      state.context()->getClock()->getCurrentTime() +
       std::chrono::seconds(nst.ticket_lifetime);
+  newCachedPsk.psk.ticketHandshakeTime = *state.handshakeTime();
   newCachedPsk.psk.maxEarlyDataSize = getMaxEarlyDataSize(nst);
 
   return actions(std::move(newCachedPsk));
@@ -1633,7 +1831,8 @@ EventHandler<ClientTypes, StateEnum::Established, Event::AppWrite>::handle(
 
   WriteToSocket write;
   write.callback = appWrite.callback;
-  write.data = state.writeRecordLayer()->writeAppData(std::move(appWrite.data));
+  write.contents.emplace_back(
+      state.writeRecordLayer()->writeAppData(std::move(appWrite.data)));
   write.flags = appWrite.flags;
 
   return actions(std::move(write));
@@ -1651,14 +1850,15 @@ EventHandler<ClientTypes, StateEnum::Established, Event::KeyUpdate>::handle(
   }
   state.keyScheduler()->serverKeyUpdate();
   auto readRecordLayer =
-      state.context()->getFactory()->makeEncryptedReadRecordLayer();
+      state.context()->getFactory()->makeEncryptedReadRecordLayer(
+          EncryptionLevel::AppTraffic);
   readRecordLayer->setProtocolVersion(*state.version());
   auto readSecret =
       state.keyScheduler()->getSecret(AppTrafficSecrets::ServerAppTraffic);
   Protocol::setAead(
       *readRecordLayer,
       *state.cipher(),
-      folly::range(readSecret),
+      folly::range(readSecret.secret),
       *state.context()->getFactory(),
       *state.keyScheduler());
 
@@ -1672,20 +1872,21 @@ EventHandler<ClientTypes, StateEnum::Established, Event::KeyUpdate>::handle(
   auto encodedKeyUpdated =
       Protocol::getKeyUpdated(KeyUpdateRequest::update_not_requested);
   WriteToSocket write;
-  write.data =
-      state.writeRecordLayer()->writeHandshake(std::move(encodedKeyUpdated));
+  write.contents.emplace_back(
+      state.writeRecordLayer()->writeHandshake(std::move(encodedKeyUpdated)));
 
   state.keyScheduler()->clientKeyUpdate();
 
   auto writeRecordLayer =
-      state.context()->getFactory()->makeEncryptedWriteRecordLayer();
+      state.context()->getFactory()->makeEncryptedWriteRecordLayer(
+          EncryptionLevel::AppTraffic);
   writeRecordLayer->setProtocolVersion(*state.version());
   auto writeSecret =
       state.keyScheduler()->getSecret(AppTrafficSecrets::ClientAppTraffic);
   Protocol::setAead(
       *writeRecordLayer,
       *state.cipher(),
-      folly::range(writeSecret),
+      folly::range(writeSecret.secret),
       *state.context()->getFactory(),
       *state.keyScheduler());
 
@@ -1695,6 +1896,8 @@ EventHandler<ClientTypes, StateEnum::Established, Event::KeyUpdate>::handle(
         newState.readRecordLayer() = std::move(rRecordLayer);
         newState.writeRecordLayer() = std::move(wRecordLayer);
       },
+      SecretAvailable(std::move(readSecret)),
+      SecretAvailable(std::move(writeSecret)),
       std::move(write));
 }
 
@@ -1715,6 +1918,10 @@ static Actions ignoreEarlyAppWrite(const State& state, EarlyAppWrite write) {
 }
 
 static Actions handleEarlyAppWrite(const State& state, EarlyAppWrite appWrite) {
+  if (state.context()->getOmitEarlyRecordLayer()) {
+    throw FizzException("early app writes disabled", folly::none);
+  }
+
   switch (*state.earlyDataType()) {
     case EarlyDataType::NotAttempted:
       throw FizzException("invalid early write", folly::none);
@@ -1724,19 +1931,22 @@ static Actions handleEarlyAppWrite(const State& state, EarlyAppWrite appWrite) {
     case EarlyDataType::Accepted: {
       WriteToSocket write;
       write.callback = appWrite.callback;
-      write.data =
-          state.earlyWriteRecordLayer()->writeAppData(std::move(appWrite.data));
       write.flags = appWrite.flags;
+      auto appData =
+          state.earlyWriteRecordLayer()->writeAppData(std::move(appWrite.data));
 
       if (!state.sentCCS() && state.context()->getCompatibilityMode()) {
-        auto realData = std::move(write.data);
-        write.data = folly::IOBuf::wrapBuffer(FakeChangeCipherSpec);
-        write.data->prependChain(std::move(realData));
-
+        TLSContent writeCCS;
+        writeCCS.data = folly::IOBuf::wrapBuffer(FakeChangeCipherSpec);
+        writeCCS.contentType = ContentType::change_cipher_spec;
+        writeCCS.encryptionLevel = EncryptionLevel::Plaintext;
+        write.contents.emplace_back(std::move(writeCCS));
+        write.contents.emplace_back(std::move(appData));
         return actions(
             [](State& newState) { newState.sentCCS() = true; },
             std::move(write));
       } else {
+        write.contents.emplace_back(std::move(appData));
         return actions(std::move(write));
       }
     }
@@ -1795,13 +2005,54 @@ EventHandler<ClientTypes, StateEnum::Established, Event::EarlyAppWrite>::handle(
     // the all-or-nothing property of early data.
     WriteToSocket write;
     write.callback = appWrite.callback;
-    write.data =
-        state.writeRecordLayer()->writeAppData(std::move(appWrite.data));
+    write.contents.emplace_back(
+        state.writeRecordLayer()->writeAppData(std::move(appWrite.data)));
     write.flags = appWrite.flags;
     return actions(std::move(write));
   } else {
     return ignoreEarlyAppWrite(state, std::move(appWrite));
   }
 }
+
+Actions
+EventHandler<ClientTypes, StateEnum::Established, Event::CloseNotify>::handle(
+    const State& state,
+    Param param) {
+  ensureNoUnparsedHandshakeData(state, Event::CloseNotify);
+  auto& closenotify = boost::get<CloseNotify>(param);
+  auto eod = EndOfData(std::move(closenotify.ignoredPostCloseData));
+
+  auto clearRecordLayers = [](State& newState) {
+    newState.writeRecordLayer() = nullptr;
+    newState.readRecordLayer() = nullptr;
+  };
+
+  WriteToSocket write;
+  write.contents.emplace_back(state.writeRecordLayer()->writeAlert(
+      Alert(AlertDescription::close_notify)));
+  return actions(
+      std::move(write),
+      std::move(clearRecordLayers),
+      &Transition<StateEnum::Closed>,
+      std::move(eod));
+}
+
+Actions
+EventHandler<ClientTypes, StateEnum::ExpectingCloseNotify, Event::CloseNotify>::
+    handle(const State& state, Param param) {
+  ensureNoUnparsedHandshakeData(state, Event::CloseNotify);
+  auto& closenotify = boost::get<CloseNotify>(param);
+  auto eod = EndOfData(std::move(closenotify.ignoredPostCloseData));
+
+  auto clearRecordLayers = [](State& newState) {
+    newState.readRecordLayer() = nullptr;
+    newState.writeRecordLayer() = nullptr;
+  };
+  return actions(
+      std::move(clearRecordLayers),
+      &Transition<StateEnum::Closed>,
+      std::move(eod));
+}
+
 } // namespace sm
 } // namespace fizz

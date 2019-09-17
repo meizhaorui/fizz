@@ -9,7 +9,8 @@
 #pragma once
 
 #include <fizz/protocol/Certificate.h>
-#include <fizz/protocol/Factory.h>
+#include <fizz/protocol/OpenSSLFactory.h>
+#include <fizz/protocol/clock/SystemClock.h>
 #include <fizz/record/Types.h>
 #include <fizz/server/CertManager.h>
 #include <fizz/server/CookieCipher.h>
@@ -44,7 +45,7 @@ enum class ClientAuthMode { None, Optional, Required };
 
 class FizzServerContext {
  public:
-  FizzServerContext() : factory_(std::make_unique<Factory>()) {}
+  FizzServerContext() : factory_(std::make_shared<OpenSSLFactory>()) {}
   virtual ~FizzServerContext() = default;
 
   /**
@@ -168,7 +169,7 @@ class FizzServerContext {
   /**
    * Sets the CertManager to use.
    */
-  void setCertManager(std::unique_ptr<CertManager> manager) {
+  void setCertManager(std::shared_ptr<CertManager> manager) {
     certManager_ = std::move(manager);
   }
 
@@ -217,10 +218,7 @@ class FizzServerContext {
 
   bool getAcceptEarlyData(ProtocolVersion version) const {
     if (earlyDataFbOnly_ &&
-        (version != ProtocolVersion::tls_1_3_20_fb &&
-         version != ProtocolVersion::tls_1_3_21_fb &&
-         version != ProtocolVersion::tls_1_3_22_fb &&
-         version != ProtocolVersion::tls_1_3_23_fb &&
+        (version != ProtocolVersion::tls_1_3_23_fb &&
          version != ProtocolVersion::tls_1_3_26_fb)) {
       return false;
     }
@@ -252,7 +250,7 @@ class FizzServerContext {
   /**
    * Set the factory to use. Should generally only be changed for testing.
    */
-  void setFactory(std::unique_ptr<Factory> factory) {
+  void setFactory(std::shared_ptr<Factory> factory) {
     factory_ = std::move(factory);
   }
   const Factory* getFactory() const {
@@ -273,23 +271,54 @@ class FizzServerContext {
     return sendNewSessionTicket_;
   }
 
+  /**
+   * Set supported cert compression algorithms. Note: It is expected that any
+   * certificate used has been initialized with compressors corresponding to the
+   * algorithms set here.
+   */
+  void setSupportedCompressionAlgorithms(
+      std::vector<CertificateCompressionAlgorithm> algos) {
+    supportedCompressionAlgos_ = algos;
+  }
+  const auto& getSupportedCompressionAlgorithms() const {
+    return supportedCompressionAlgos_;
+  }
+
+  /**
+   * Whether to omit the early record layer when sending early data. This will
+   * also omit the EndOfEarlyData message.
+   * Default is false, and using this requires a custom record layer.
+   */
+  void setOmitEarlyRecordLayer(bool enabled) {
+    omitEarlyRecordLayer_ = enabled;
+  }
+  bool getOmitEarlyRecordLayer() const {
+    return omitEarlyRecordLayer_;
+  }
+
+  void setClock(std::shared_ptr<Clock> clock) {
+    clock_ = clock;
+  }
+  const Clock& getClock() const {
+    return *clock_;
+  }
+
  private:
-  std::unique_ptr<Factory> factory_;
+  std::shared_ptr<Factory> factory_;
 
   std::shared_ptr<TicketCipher> ticketCipher_;
   std::shared_ptr<CookieCipher> cookieCipher_;
 
-  std::unique_ptr<CertManager> certManager_;
+  std::shared_ptr<CertManager> certManager_;
   std::shared_ptr<const CertificateVerifier> clientCertVerifier_;
 
-  std::vector<ProtocolVersion> supportedVersions_ = {
-      ProtocolVersion::tls_1_3_26};
+  std::vector<ProtocolVersion> supportedVersions_ = {ProtocolVersion::tls_1_3};
   std::vector<std::vector<CipherSuite>> supportedCiphers_ = {
       {
           CipherSuite::TLS_AES_128_GCM_SHA256,
-#if FOLLY_OPENSSL_IS_110
+#if FOLLY_OPENSSL_HAS_CHACHA
           CipherSuite::TLS_CHACHA20_POLY1305_SHA256,
-#endif // FOLLY_OPENSSL_IS_110
+#endif // FOLLY_OPENSSL_HAS_CHACHA
       },
       {CipherSuite::TLS_AES_256_GCM_SHA384},
   };
@@ -310,10 +339,15 @@ class FizzServerContext {
   uint32_t maxEarlyDataSize_{std::numeric_limits<uint32_t>::max()};
   ClockSkewTolerance clockSkewTolerance_;
   std::shared_ptr<ReplayCache> replayCache_;
+  std::shared_ptr<Clock> clock_ = std::make_shared<SystemClock>();
+
+  std::vector<CertificateCompressionAlgorithm> supportedCompressionAlgos_;
 
   bool earlyDataFbOnly_{false};
 
   bool sendNewSessionTicket_{true};
+
+  bool omitEarlyRecordLayer_{false};
 };
 } // namespace server
 } // namespace fizz

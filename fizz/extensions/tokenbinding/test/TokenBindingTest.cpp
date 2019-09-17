@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/extensions/tokenbinding/TokenBindingContext.h>
 #include <fizz/extensions/tokenbinding/Types.h>
@@ -18,10 +18,7 @@
 using namespace fizz::extensions;
 
 using namespace folly;
-using namespace folly::io;
 
-using testing::_;
-using namespace testing;
 
 StringPiece tokenBinding{"00180004000d0102"};
 

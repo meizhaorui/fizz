@@ -11,12 +11,17 @@
 #include <fizz/crypto/aead/test/Mocks.h>
 #include <fizz/crypto/exchange/test/Mocks.h>
 #include <fizz/crypto/test/Mocks.h>
+#include <fizz/protocol/AsyncFizzBase.h>
 #include <fizz/protocol/Certificate.h>
+#include <fizz/protocol/CertificateCompressor.h>
 #include <fizz/protocol/CertificateVerifier.h>
-#include <fizz/protocol/Factory.h>
 #include <fizz/protocol/HandshakeContext.h>
 #include <fizz/protocol/KeyScheduler.h>
+#include <fizz/protocol/OpenSSLFactory.h>
+#include <fizz/protocol/Types.h>
 #include <fizz/record/test/Mocks.h>
+
+#include <folly/io/async/test/MockAsyncTransport.h>
 
 /* using override */
 using namespace testing;
@@ -38,14 +43,14 @@ class MockKeyScheduler : public KeyScheduler {
   MOCK_METHOD0(serverKeyUpdate, uint32_t());
   MOCK_CONST_METHOD2(
       getSecret,
-      std::vector<uint8_t>(EarlySecrets s, folly::ByteRange transcript));
+      DerivedSecret(EarlySecrets s, folly::ByteRange transcript));
   MOCK_CONST_METHOD2(
       getSecret,
-      std::vector<uint8_t>(HandshakeSecrets s, folly::ByteRange transcript));
+      DerivedSecret(HandshakeSecrets s, folly::ByteRange transcript));
   MOCK_CONST_METHOD2(
       getSecret,
-      std::vector<uint8_t>(MasterSecrets s, folly::ByteRange transcript));
-  MOCK_CONST_METHOD1(getSecret, std::vector<uint8_t>(AppTrafficSecrets s));
+      DerivedSecret(MasterSecrets s, folly::ByteRange transcript));
+  MOCK_CONST_METHOD1(getSecret, DerivedSecret(AppTrafficSecrets s));
   MOCK_CONST_METHOD3(
       getTrafficKey,
       TrafficKey(
@@ -65,6 +70,22 @@ class MockKeyScheduler : public KeyScheduler {
     ON_CALL(*this, getResumptionSecret(_, _))
         .WillByDefault(InvokeWithoutArgs(
             []() { return folly::IOBuf::copyBuffer("resumesecret"); }));
+    ON_CALL(*this, getSecret(An<EarlySecrets>(), _))
+        .WillByDefault(Invoke([](EarlySecrets type, folly::ByteRange) {
+          return DerivedSecret(std::vector<uint8_t>(), type);
+        }));
+    ON_CALL(*this, getSecret(An<HandshakeSecrets>(), _))
+        .WillByDefault(Invoke([](HandshakeSecrets type, folly::ByteRange) {
+          return DerivedSecret(std::vector<uint8_t>(), type);
+        }));
+    ON_CALL(*this, getSecret(An<MasterSecrets>(), _))
+        .WillByDefault(Invoke([](MasterSecrets type, folly::ByteRange) {
+          return DerivedSecret(std::vector<uint8_t>(), type);
+        }));
+    ON_CALL(*this, getSecret(_))
+        .WillByDefault(Invoke([](AppTrafficSecrets type) {
+          return DerivedSecret(std::vector<uint8_t>(), type);
+        }));
   }
 };
 
@@ -102,6 +123,9 @@ class MockSelfCert : public SelfCert {
   CertificateMsg getCertMessage(Buf buf) const override {
     return _getCertMessage(buf);
   }
+  MOCK_CONST_METHOD1(
+      getCompressedCert,
+      CompressedCertificate(CertificateCompressionAlgorithm));
 
   MOCK_CONST_METHOD3(
       sign,
@@ -133,7 +157,7 @@ class MockCertificateVerifier : public CertificateVerifier {
   MOCK_CONST_METHOD0(getCertificateRequestExtensions, std::vector<Extension>());
 };
 
-class MockFactory : public Factory {
+class MockFactory : public OpenSSLFactory {
  public:
   MOCK_CONST_METHOD0(
       makePlaintextReadRecordLayer,
@@ -141,12 +165,14 @@ class MockFactory : public Factory {
   MOCK_CONST_METHOD0(
       makePlaintextWriteRecordLayer,
       std::unique_ptr<PlaintextWriteRecordLayer>());
-  MOCK_CONST_METHOD0(
+  MOCK_CONST_METHOD1(
       makeEncryptedReadRecordLayer,
-      std::unique_ptr<EncryptedReadRecordLayer>());
-  MOCK_CONST_METHOD0(
+      std::unique_ptr<EncryptedReadRecordLayer>(
+          EncryptionLevel encryptionLevel));
+  MOCK_CONST_METHOD1(
       makeEncryptedWriteRecordLayer,
-      std::unique_ptr<EncryptedWriteRecordLayer>());
+      std::unique_ptr<EncryptedWriteRecordLayer>(
+          EncryptionLevel encryptionLevel));
   MOCK_CONST_METHOD1(
       makeKeyScheduler,
       std::unique_ptr<KeyScheduler>(CipherSuite cipher));
@@ -167,44 +193,49 @@ class MockFactory : public Factory {
 
   void setDefaults() {
     ON_CALL(*this, makePlaintextReadRecordLayer())
-        .WillByDefault(InvokeWithoutArgs(
-            []() { return std::make_unique<MockPlaintextReadRecordLayer>(); }));
+        .WillByDefault(InvokeWithoutArgs([]() {
+          return std::make_unique<NiceMock<MockPlaintextReadRecordLayer>>();
+        }));
 
     ON_CALL(*this, makePlaintextWriteRecordLayer())
         .WillByDefault(InvokeWithoutArgs([]() {
-          auto ret = std::make_unique<MockPlaintextWriteRecordLayer>();
+          auto ret =
+              std::make_unique<NiceMock<MockPlaintextWriteRecordLayer>>();
           ret->setDefaults();
           return ret;
         }));
-    ON_CALL(*this, makeEncryptedReadRecordLayer())
-        .WillByDefault(InvokeWithoutArgs(
-            []() { return std::make_unique<MockEncryptedReadRecordLayer>(); }));
+    ON_CALL(*this, makeEncryptedReadRecordLayer(_))
+        .WillByDefault(Invoke([](EncryptionLevel encryptionLevel) {
+          return std::make_unique<NiceMock<MockEncryptedReadRecordLayer>>(
+              encryptionLevel);
+        }));
 
-    ON_CALL(*this, makeEncryptedWriteRecordLayer())
-        .WillByDefault(InvokeWithoutArgs([]() {
-          auto ret = std::make_unique<MockEncryptedWriteRecordLayer>();
+    ON_CALL(*this, makeEncryptedWriteRecordLayer(_))
+        .WillByDefault(Invoke([](EncryptionLevel encryptionLevel) {
+          auto ret = std::make_unique<NiceMock<MockEncryptedWriteRecordLayer>>(
+              encryptionLevel);
           ret->setDefaults();
           return ret;
         }));
 
     ON_CALL(*this, makeKeyScheduler(_)).WillByDefault(InvokeWithoutArgs([]() {
-      auto ret = std::make_unique<MockKeyScheduler>();
+      auto ret = std::make_unique<NiceMock<MockKeyScheduler>>();
       ret->setDefaults();
       return ret;
     }));
     ON_CALL(*this, makeHandshakeContext(_))
         .WillByDefault(InvokeWithoutArgs([]() {
-          auto ret = std::make_unique<MockHandshakeContext>();
+          auto ret = std::make_unique<NiceMock<MockHandshakeContext>>();
           ret->setDefaults();
           return ret;
         }));
     ON_CALL(*this, makeKeyExchange(_)).WillByDefault(InvokeWithoutArgs([]() {
-      auto ret = std::make_unique<MockKeyExchange>();
+      auto ret = std::make_unique<NiceMock<MockKeyExchange>>();
       ret->setDefaults();
       return ret;
     }));
     ON_CALL(*this, makeAead(_)).WillByDefault(InvokeWithoutArgs([]() {
-      auto ret = std::make_unique<MockAead>();
+      auto ret = std::make_unique<NiceMock<MockAead>>();
       ret->setDefaults();
       return ret;
     }));
@@ -217,9 +248,79 @@ class MockFactory : public Factory {
       return 0x44444444;
     }));
     ON_CALL(*this, _makePeerCert(_)).WillByDefault(InvokeWithoutArgs([]() {
-      return std::make_unique<MockPeerCert>();
+      return std::make_unique<NiceMock<MockPeerCert>>();
     }));
   }
 };
+
+class MockCertificateDecompressor : public CertificateDecompressor {
+ public:
+  MOCK_CONST_METHOD0(getAlgorithm, CertificateCompressionAlgorithm());
+  MOCK_METHOD1(decompress, CertificateMsg(const CompressedCertificate&));
+  void setDefaults() {
+    ON_CALL(*this, getAlgorithm()).WillByDefault(InvokeWithoutArgs([]() {
+      return CertificateCompressionAlgorithm::zlib;
+    }));
+  }
+};
+
+class MockCertificateCompressor : public CertificateCompressor {
+ public:
+  MOCK_CONST_METHOD0(getAlgorithm, CertificateCompressionAlgorithm());
+  MOCK_METHOD1(compress, CompressedCertificate(const CertificateMsg&));
+  void setDefaults() {
+    ON_CALL(*this, getAlgorithm()).WillByDefault(InvokeWithoutArgs([]() {
+      return CertificateCompressionAlgorithm::zlib;
+    }));
+  }
+};
+
+class MockAsyncFizzBase : public AsyncFizzBase {
+ public:
+  MockAsyncFizzBase()
+      : AsyncFizzBase(AsyncTransportWrapper::UniquePtr(
+            new folly::test::MockAsyncTransport())) {}
+  MOCK_CONST_METHOD0(good, bool());
+  MOCK_CONST_METHOD0(readable, bool());
+  MOCK_CONST_METHOD0(connecting, bool());
+  MOCK_CONST_METHOD0(error, bool());
+  MOCK_CONST_METHOD0(getPeerCert, folly::ssl::X509UniquePtr());
+  MOCK_CONST_METHOD0(getSelfCert, const X509*());
+  MOCK_CONST_METHOD0(isReplaySafe, bool());
+  MOCK_METHOD1(
+      setReplaySafetyCallback,
+      void(folly::AsyncTransport::ReplaySafetyCallback* callback));
+  MOCK_CONST_METHOD0(getSelfCertificate, const Cert*());
+  MOCK_CONST_METHOD0(getPeerCertificate, const Cert*());
+  MOCK_CONST_METHOD0(getApplicationProtocol_, std::string());
+
+  std::string getApplicationProtocol() const noexcept override {
+    return getApplicationProtocol_();
+  }
+
+  MOCK_CONST_METHOD0(getCipher, folly::Optional<CipherSuite>());
+  MOCK_CONST_METHOD0(getSupportedSigSchemes, std::vector<SignatureScheme>());
+  MOCK_CONST_METHOD3(getEkm, Buf(folly::StringPiece, const Buf&, uint16_t));
+
+  MOCK_METHOD3(
+      writeAppDataInternal,
+      void(
+          folly::AsyncTransportWrapper::WriteCallback*,
+          std::shared_ptr<folly::IOBuf>,
+          folly::WriteFlags));
+
+  void writeAppData(
+      folly::AsyncTransportWrapper::WriteCallback* callback,
+      std::unique_ptr<folly::IOBuf>&& buf,
+      folly::WriteFlags flags = folly::WriteFlags::NONE) override {
+    writeAppDataInternal(
+        callback, std::shared_ptr<folly::IOBuf>(buf.release()), flags);
+  }
+
+  MOCK_METHOD1(transportError, void(const folly::AsyncSocketException&));
+
+  MOCK_METHOD0(transportDataAvailable, void());
+};
+
 } // namespace test
 } // namespace fizz

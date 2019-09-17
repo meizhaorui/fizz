@@ -8,6 +8,7 @@
 
 #pragma once
 
+#include <fizz/protocol/Factory.h>
 #include <fizz/protocol/Params.h>
 #include <folly/Overload.h>
 
@@ -51,9 +52,16 @@ class FizzBase {
   void earlyAppWrite(EarlyAppWrite appWrite);
 
   /**
-   * Called when the application wants to close the connection.
+   * Called when the application wants to close the connection, and wait for
+   * the corresponding peer's acknowledgement.
    */
   void appClose();
+
+  /**
+   * Called when the application wants to immediately close the connection
+   * without waiting for the corresponding peer's acknowledgement.
+   */
+  void appCloseImmediate();
 
   /**
    * Called to pause processing of transportReadBuf until new data is available.
@@ -81,6 +89,12 @@ class FizzBase {
   bool inErrorState() const;
 
   /**
+   * Returns true if in a terminal state where no further events will be
+   * processed.
+   */
+  bool inTerminalState() const;
+
+  /**
    * Returns true if the state machine is actively processing an event or
    * action.
    */
@@ -90,8 +104,11 @@ class FizzBase {
    * Returns an exported key material derived from the 1-RTT secret of the TLS
    * connection.
    */
-  Buf getEkm(folly::StringPiece label, const Buf& context, uint16_t length)
-      const;
+  Buf getEkm(
+      const Factory& factory,
+      folly::StringPiece label,
+      const Buf& context,
+      uint16_t length) const;
 
  protected:
   void processActions(typename StateMachine::CompletedActions actions);
@@ -114,7 +131,7 @@ class FizzBase {
   bool waitForData_{true};
   folly::Optional<folly::DelayedDestruction::DestructorGuard> actionGuard_;
   bool inProcessPendingEvents_{false};
-  bool inErrorState_{false};
+  bool externalError_{false};
 };
 } // namespace fizz
 

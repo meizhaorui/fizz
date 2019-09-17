@@ -6,14 +6,11 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/protocol/DefaultCertificateVerifier.h>
 #include <fizz/protocol/test/Utilities.h>
 
-using namespace folly;
-using namespace folly::ssl;
-using namespace testing;
 
 namespace fizz {
 namespace test {

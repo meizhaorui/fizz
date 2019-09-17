@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/protocol/FizzBase.h>
 #include <folly/futures/Future.h>
@@ -41,7 +41,7 @@ MATCHER_P(WriteMatches, expected, "") {
   return IOBufEqualTo()(IOBuf::copyBuffer(expected), arg.data);
 }
 
-enum class StateEnum { NotError, Error };
+enum class StateEnum { NotError, Closed, Error };
 
 struct State {
   StateEnum state() const {
@@ -91,6 +91,7 @@ class TestStateMachine {
       processEarlyAppWrite_,
       Future<Actions>(const State&, EarlyAppWrite&));
   MOCK_METHOD1(processAppClose, Future<Actions>(const State&));
+  MOCK_METHOD1(processAppCloseImmediate, Future<Actions>(const State&));
 
   static TestStateMachine* instance;
 };
@@ -432,8 +433,10 @@ TEST_F(FizzBaseTest, TestErrorPendingEvents) {
   EXPECT_CALL(earlyWriteCallback_, writeErr_(0, _));
   EXPECT_CALL(writeCallback_, writeErr_(0, _));
   EXPECT_FALSE(testFizz_->inErrorState());
+  EXPECT_FALSE(testFizz_->inTerminalState());
   testFizz_->appWrite(appWrite("write1"));
-  EXPECT_TRUE(testFizz_->inErrorState());
+  EXPECT_FALSE(testFizz_->inErrorState());
+  EXPECT_TRUE(testFizz_->inTerminalState());
 }
 
 TEST_F(FizzBaseTest, EventAfterErrorState) {
@@ -444,8 +447,10 @@ TEST_F(FizzBaseTest, EventAfterErrorState) {
         return Actions{};
       }));
   EXPECT_FALSE(testFizz_->inErrorState());
+  EXPECT_FALSE(testFizz_->inTerminalState());
   testFizz_->newTransportData();
-  EXPECT_TRUE(testFizz_->inErrorState());
+  EXPECT_FALSE(testFizz_->inErrorState());
+  EXPECT_TRUE(testFizz_->inTerminalState());
 }
 
 TEST_F(FizzBaseTest, TestManyActions) {
@@ -458,6 +463,32 @@ TEST_F(FizzBaseTest, TestManyActions) {
         return Actions{};
       }));
   testFizz_->newTransportData();
+}
+
+TEST_F(FizzBaseTest, TestMoveToErrorStateOnVisit) {
+  EXPECT_CALL(*TestStateMachine::instance, processSocketData(_, _))
+      .WillOnce(InvokeWithoutArgs([]() {
+        return Actions{A1(), A2()};
+      }));
+  EXPECT_CALL(testFizz_->visitor_, a1()).WillOnce(Invoke([this]() {
+    testFizz_->moveToErrorState(folly::AsyncSocketException(
+        folly::AsyncSocketException::NOT_OPEN, "Transport is not good"));
+  }));
+  EXPECT_CALL(testFizz_->visitor_, a2());
+  testFizz_->newTransportData();
+}
+
+TEST_F(FizzBaseTest, TestActionProcessedAfterError) {
+  EXPECT_CALL(testFizz_->visitor_, a1());
+  EXPECT_CALL(testFizz_->visitor_, a2());
+  EXPECT_CALL(*TestStateMachine::instance, processSocketData(_, _))
+      .WillOnce(InvokeWithoutArgs([&]() {
+        testFizz_->state_.state_ = StateEnum::Error;
+        return Actions{A1(), A2()};
+      }));
+  EXPECT_FALSE(testFizz_->inErrorState());
+  testFizz_->newTransportData();
+  EXPECT_TRUE(testFizz_->inErrorState());
 }
 } // namespace test
 } // namespace fizz

@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <folly/io/Cursor.h>
 #include <folly/io/IOBuf.h>
@@ -17,8 +17,6 @@
 using namespace folly;
 using namespace folly::io;
 
-using testing::_;
-using namespace testing;
 
 namespace fizz {
 namespace test {

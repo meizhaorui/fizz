@@ -8,7 +8,7 @@
 
 #pragma once
 
-#include <gmock/gmock.h>
+#include <folly/portability/GMock.h>
 
 #include <fizz/crypto/aead/test/Mocks.h>
 #include <fizz/crypto/exchange/test/Mocks.h>
@@ -83,6 +83,13 @@ class MockServerStateMachine : public ServerStateMachine {
   Actions processAppClose(const State& state) override {
     return *_processAppClose(state);
   }
+
+  MOCK_METHOD1(
+      _processAppCloseImmediate,
+      folly::Optional<Actions>(const State&));
+  Actions processAppCloseImmediate(const State& state) override {
+    return *_processAppCloseImmediate(state);
+  }
 };
 
 class MockTicketCipher : public TicketCipher {
@@ -105,18 +112,21 @@ class MockTicketCipher : public TicketCipher {
     return _decrypt(encryptedTicket);
   }
 
-  void setDefaults() {
-    ON_CALL(*this, _decrypt(_)).WillByDefault(InvokeWithoutArgs([]() {
-      ResumptionState res;
-      res.version = ProtocolVersion::tls_1_3;
-      res.cipher = CipherSuite::TLS_AES_128_GCM_SHA256;
-      res.resumptionSecret = folly::IOBuf::copyBuffer("resumesecret");
-      res.alpn = "h2";
-      res.ticketAgeAdd = 0;
-      res.ticketIssueTime =
-          std::chrono::system_clock::now() - std::chrono::seconds(100);
-      return std::make_pair(PskType::Resumption, std::move(res));
-    }));
+  void setDefaults(
+      std::chrono::system_clock::time_point ticketIssued =
+          std::chrono::system_clock::now()) {
+    ON_CALL(*this, _decrypt(_))
+        .WillByDefault(InvokeWithoutArgs([ticketIssued]() {
+          ResumptionState res;
+          res.version = ProtocolVersion::tls_1_3;
+          res.cipher = CipherSuite::TLS_AES_128_GCM_SHA256;
+          res.resumptionSecret = folly::IOBuf::copyBuffer("resumesecret");
+          res.alpn = "h2";
+          res.ticketAgeAdd = 0;
+          res.ticketIssueTime = ticketIssued;
+          res.handshakeTime = ticketIssued;
+          return std::make_pair(PskType::Resumption, std::move(res));
+        }));
     ON_CALL(*this, _encrypt(_)).WillByDefault(InvokeWithoutArgs([]() {
       return std::make_pair(
           folly::IOBuf::copyBuffer("ticket"), std::chrono::seconds(100));

@@ -8,8 +8,8 @@
 
 #pragma once
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/protocol/Actions.h>
 #include <fizz/protocol/test/Matchers.h>
@@ -40,6 +40,25 @@ class ProtocolTest : public testing::Test {
       }
     }
     throw std::runtime_error("did not find expected action");
+  }
+
+  template <class T>
+  void expectSecret(
+      Actions& actions,
+      T secretType,
+      folly::ByteRange expectedSecret) {
+    DerivedSecret expectedDerivedSecret(expectedSecret, SecretType(secretType));
+    for (auto& action : actions) {
+      auto trySecret = boost::get<SecretAvailable>(&action);
+      if (trySecret) {
+        bool match = trySecret->secret.secret == expectedDerivedSecret.secret &&
+            trySecret->secret.type == expectedDerivedSecret.type;
+        if (match) {
+          return;
+        }
+      }
+    }
+    FAIL() << "Did not get expected secret";
   }
 
   template <typename T>
@@ -79,7 +98,12 @@ class ProtocolTest : public testing::Test {
         getNumActions<T2, Args...>(actions, expectNonZero);
   }
 
-  void expectError(
+  void expectExceptionType(Actions& actions) {
+    auto error = expectAction<ReportError>(actions);
+  }
+
+  template <typename ExceptionType>
+  ExceptionType expectError(
       Actions& actions,
       folly::Optional<AlertDescription> alert,
       std::string msg = "") {
@@ -90,16 +114,19 @@ class ProtocolTest : public testing::Test {
       a.description = *alert;
       auto buf = folly::IOBuf::copyBuffer("alert");
       buf->prependChain(encode(std::move(a)));
-      EXPECT_TRUE(folly::IOBufEqualTo()(write.data, buf));
+      EXPECT_TRUE(folly::IOBufEqualTo()(write.contents[0].data, buf));
     } else {
       expectActions<MutateState, ReportError>(actions);
     }
     auto error = expectAction<ReportError>(actions);
+    auto ex = error.error.template get_exception<ExceptionType>();
+    EXPECT_NE(ex, nullptr);
     EXPECT_THAT(error.error.what().toStdString(), HasSubstr(msg));
     processStateMutations(actions);
     EXPECT_EQ(state_.state(), SM::StateEnum::Error);
     EXPECT_EQ(state_.readRecordLayer(), nullptr);
     EXPECT_EQ(state_.writeRecordLayer(), nullptr);
+    return *ex;
   }
 
   void expectAeadCreation(std::map<std::string, MockAead**> keys) {
@@ -121,18 +148,23 @@ class ProtocolTest : public testing::Test {
   void expectEncryptedReadRecordLayerCreation(
       MockEncryptedReadRecordLayer** recordLayer,
       MockAead** readAead,
+      folly::ByteRange expectedBaseSecret,
       folly::Optional<bool> skipFailedDecryption = folly::none,
       Sequence* s = nullptr) {
-    EXPECT_CALL(*factory_, makeEncryptedReadRecordLayer())
+    EXPECT_CALL(*factory_, makeEncryptedReadRecordLayer(_))
         .InSequence(s ? *s : Sequence())
-        .WillOnce(Invoke([=]() {
-          auto ret = std::make_unique<MockEncryptedReadRecordLayer>();
+        .WillOnce(Invoke([=](EncryptionLevel encryptionLevel) {
+          auto ret =
+              std::make_unique<MockEncryptedReadRecordLayer>(encryptionLevel);
           *recordLayer = ret.get();
-          EXPECT_CALL(*ret, _setAead(_)).WillOnce(Invoke([=](Aead* aead) {
-            EXPECT_EQ(aead, *readAead);
-          }));
+          EXPECT_CALL(*ret, _setAead(_, _))
+              .WillOnce(Invoke([=](folly::ByteRange baseSecret, Aead* aead) {
+                EXPECT_TRUE(baseSecret == expectedBaseSecret);
+                EXPECT_EQ(aead, *readAead);
+              }));
           if (skipFailedDecryption.hasValue()) {
-            EXPECT_CALL(*ret, setSkipFailedDecryption(*skipFailedDecryption));
+            EXPECT_CALL(
+                *ret, setSkipFailedDecryption(skipFailedDecryption.value()));
           }
           return ret;
         }));
@@ -141,19 +173,29 @@ class ProtocolTest : public testing::Test {
   void expectEncryptedWriteRecordLayerCreation(
       MockEncryptedWriteRecordLayer** recordLayer,
       MockAead** writeAead,
-      Buf (*expectedWrite)(TLSMessage&) = nullptr,
+      folly::ByteRange expectedBaseSecret,
+      std::function<TLSContent(TLSMessage&, MockEncryptedWriteRecordLayer*)>
+          expectedWrite = nullptr,
       Sequence* s = nullptr) {
-    EXPECT_CALL(*factory_, makeEncryptedWriteRecordLayer())
+    EXPECT_CALL(*factory_, makeEncryptedWriteRecordLayer(_))
         .InSequence(s ? *s : Sequence())
-        .WillOnce(Invoke([=]() {
-          auto ret = std::make_unique<MockEncryptedWriteRecordLayer>();
+        .WillOnce(Invoke([=](EncryptionLevel encryptionLevel) {
+          auto ret =
+              std::make_unique<MockEncryptedWriteRecordLayer>(encryptionLevel);
           ret->setDefaults();
           *recordLayer = ret.get();
-          EXPECT_CALL(*ret, _setAead(_)).WillOnce(Invoke([=](Aead* aead) {
-            EXPECT_EQ(aead, *writeAead);
-          }));
+          EXPECT_CALL(*ret, _setAead(_, _))
+              .WillOnce(Invoke([=](folly::ByteRange baseSecret, Aead* aead) {
+                EXPECT_TRUE(baseSecret == expectedBaseSecret);
+                EXPECT_EQ(aead, *writeAead);
+              }));
           if (expectedWrite) {
-            EXPECT_CALL(*ret, _write(_)).WillOnce(Invoke(expectedWrite));
+            EXPECT_CALL(*ret, _write(_))
+                .WillOnce(
+                    Invoke([writeFunc = std::move(expectedWrite),
+                            writeRecord = *recordLayer](auto& msg) mutable {
+                      return writeFunc(msg, writeRecord);
+                    }));
           }
           return ret;
         }));

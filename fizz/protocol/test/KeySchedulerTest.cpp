@@ -6,7 +6,7 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/protocol/KeyScheduler.h>
 
@@ -139,6 +139,33 @@ TEST_F(KeySchedulerTest, TestTrafficKey) {
   EXPECT_CALL(*kd_, _expandLabel(_, _, _, _)).Times(2);
   StringPiece trafficSecret{"secret"};
   ks_->getTrafficKey(trafficSecret, 10, 10);
+}
+
+TEST_F(KeySchedulerTest, TestTrafficKeyWithLabel) {
+  StringPiece trafficSecret{"secret"};
+  StringPiece keyLabel{"fookey"};
+  StringPiece ivLabel{"fooiv"};
+
+  InSequence seq;
+  EXPECT_CALL(*kd_, _expandLabel(_, _, _, _))
+      .WillOnce(
+          Invoke([&](auto secret, auto label, const auto&, const auto& len) {
+            EXPECT_EQ(folly::hexlify(trafficSecret), folly::hexlify(secret));
+            EXPECT_EQ(folly::hexlify(label), folly::hexlify(keyLabel));
+            auto res = IOBuf::create(len);
+            res->append(len);
+            return res;
+          }));
+  EXPECT_CALL(*kd_, _expandLabel(_, _, _, _))
+      .WillOnce(
+          Invoke([&](auto secret, auto label, const auto&, const auto& len) {
+            EXPECT_EQ(folly::hexlify(trafficSecret), folly::hexlify(secret));
+            EXPECT_EQ(folly::hexlify(label), folly::hexlify(ivLabel));
+            auto res = IOBuf::create(len);
+            res->append(len);
+            return res;
+          }));
+  ks_->getTrafficKeyWithLabel(trafficSecret, keyLabel, ivLabel, 10, 10);
 }
 } // namespace test
 } // namespace fizz

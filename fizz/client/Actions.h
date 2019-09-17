@@ -74,11 +74,17 @@ using Action = boost::variant<
     ReportEarlyHandshakeSuccess,
     ReportEarlyWriteFailed,
     ReportError,
+    EndOfData,
     MutateState,
     WaitForData,
-    NewCachedPsk>;
-// TODO use small_vector once we are sure it is portable.
+    NewCachedPsk,
+    SecretAvailable>;
+
+#if FOLLY_MOBILE
 using Actions = std::vector<Action>;
+#else
+using Actions = folly::small_vector<Action, 4>;
+#endif
 
 namespace detail {
 

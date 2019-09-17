@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/record/EncryptedRecordLayer.h>
 
@@ -15,7 +15,6 @@
 #include <folly/String.h>
 
 using namespace folly;
-using namespace folly::io;
 
 using testing::_;
 using namespace testing;
@@ -27,15 +26,15 @@ class EncryptedRecordTest : public testing::Test {
   void SetUp() override {
     auto readAead = std::make_unique<MockAead>();
     readAead_ = readAead.get();
-    read_.setAead(std::move(readAead));
+    read_.setAead(folly::ByteRange(), std::move(readAead));
     auto writeAead = std::make_unique<MockAead>();
     writeAead_ = writeAead.get();
-    write_.setAead(std::move(writeAead));
+    write_.setAead(folly::ByteRange(), std::move(writeAead));
   }
 
  protected:
-  EncryptedReadRecordLayer read_;
-  EncryptedWriteRecordLayer write_;
+  EncryptedReadRecordLayer read_{EncryptionLevel::AppTraffic};
+  EncryptedWriteRecordLayer write_{EncryptionLevel::AppTraffic};
   MockAead* readAead_;
   MockAead* writeAead_;
 
@@ -93,6 +92,7 @@ TEST_F(EncryptedRecordTest, TestReadAppData) {
   addToQueue("17030100050123456789");
   EXPECT_CALL(*readAead_, _decrypt(_, _, 0))
       .WillOnce(Invoke([](std::unique_ptr<IOBuf>& buf, const IOBuf*, uint64_t) {
+        EXPECT_FALSE(buf->isShared());
         expectSame(buf, "0123456789");
         return getBuf("1234abcd17");
       }));
@@ -257,7 +257,7 @@ TEST_F(EncryptedRecordTest, TestWriteHandshake) {
         return getBuf("abcd1234abcd");
       }));
   auto buf = write_.write(std::move(msg));
-  expectSame(buf, "1703030006abcd1234abcd");
+  expectSame(buf.data, "1703030006abcd1234abcd");
 }
 
 TEST_F(EncryptedRecordTest, TestWriteAppData) {
@@ -268,7 +268,7 @@ TEST_F(EncryptedRecordTest, TestWriteAppData) {
         return getBuf("abcd1234abcd");
       }));
   auto buf = write_.write(std::move(msg));
-  expectSame(buf, "1703030006abcd1234abcd");
+  expectSame(buf.data, "1703030006abcd1234abcd");
 }
 
 TEST_F(EncryptedRecordTest, TestWriteAppDataInPlace) {
@@ -282,8 +282,8 @@ TEST_F(EncryptedRecordTest, TestWriteAppDataInPlace) {
         return getBuf("abcd1234abcd", 5, 0);
       }));
   auto buf = write_.write(std::move(msg));
-  EXPECT_FALSE(buf->isChained());
-  expectSame(buf, "1703030006abcd1234abcd");
+  EXPECT_FALSE(buf.data->isChained());
+  expectSame(buf.data, "1703030006abcd1234abcd");
 }
 
 TEST_F(EncryptedRecordTest, TestFragmentedWrite) {
@@ -305,7 +305,7 @@ TEST_F(EncryptedRecordTest, TestFragmentedWrite) {
             return getBuf("bbbb");
           }));
   auto outBuf = write_.write(std::move(msg));
-  expectSame(outBuf, "1703034001aaaa1703030a01bbbb");
+  expectSame(outBuf.data, "1703034001aaaa1703030a01bbbb");
 }
 
 TEST_F(EncryptedRecordTest, TestWriteSplittingWholeBuf) {
@@ -356,7 +356,7 @@ TEST_F(EncryptedRecordTest, TestWriteSeqNum) {
 TEST_F(EncryptedRecordTest, TestWriteEmpty) {
   TLSMessage msg{ContentType::application_data, folly::IOBuf::create(0)};
   auto outBuf = write_.write(std::move(msg));
-  EXPECT_TRUE(outBuf->empty());
+  EXPECT_TRUE(outBuf.data->empty());
 }
 
 TEST_F(EncryptedRecordTest, TestWriteMaxSize) {
@@ -373,6 +373,31 @@ TEST_F(EncryptedRecordTest, TestWriteMaxSize) {
           Invoke([](std::unique_ptr<IOBuf>& /*buf*/, const IOBuf*, uint64_t) {
             return getBuf("aaaa");
           }));
+  write_.write(std::move(msg));
+}
+
+TEST_F(EncryptedRecordTest, TestWriteMinSize) {
+  write_.setMinDesiredRecord(1700);
+  TLSMessage msg{ContentType::application_data, IOBuf::create(1000)};
+  msg.fragment->append(1000);
+  memset(msg.fragment->writableData(), 0x1, msg.fragment->length());
+  auto next = IOBuf::create(1000);
+  next->append(1000);
+  memset(next->writableData(), 0x2, next->length());
+  msg.fragment->prependChain(std::move(next));
+
+  Sequence s;
+  EXPECT_CALL(*writeAead_, _encrypt(_, _, _))
+      .WillOnce(Invoke([](std::unique_ptr<IOBuf>& buf, const IOBuf*, uint64_t) {
+        // one byte for footer
+        EXPECT_EQ(buf->computeChainDataLength(), 1701);
+        return getBuf("aaaa");
+      }))
+      .WillOnce(Invoke([](std::unique_ptr<IOBuf>& buf, const IOBuf*, uint64_t) {
+        // one byte for footer
+        EXPECT_EQ(buf->computeChainDataLength(), 301);
+        return getBuf("bbbb");
+      }));
   write_.write(std::move(msg));
 }
 } // namespace test

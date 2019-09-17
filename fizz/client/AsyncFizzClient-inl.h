@@ -6,6 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
+#include <fizz/util/Workarounds.h>
+
 namespace fizz {
 namespace client {
 
@@ -133,7 +135,7 @@ void AsyncFizzClientT<SM>::connect(
 
 template <typename SM>
 bool AsyncFizzClientT<SM>::good() const {
-  return !error() && transport_->good();
+  return !error() && !fizzClient_.inTerminalState() && transport_->good();
 }
 
 template <typename SM>
@@ -149,26 +151,6 @@ bool AsyncFizzClientT<SM>::connecting() const {
 template <typename SM>
 bool AsyncFizzClientT<SM>::error() const {
   return transport_->error() || fizzClient_.inErrorState();
-}
-
-template <typename SM>
-folly::ssl::X509UniquePtr AsyncFizzClientT<SM>::getPeerCert() const {
-  auto serverCert = getPeerCertificate();
-  if (serverCert) {
-    return serverCert->getX509();
-  } else {
-    return nullptr;
-  }
-}
-
-template <typename SM>
-const X509* AsyncFizzClientT<SM>::getSelfCert() const {
-  auto cert = getSelfCertificate();
-  if (cert) {
-    return cert->getX509().get();
-  } else {
-    return nullptr;
-  }
 }
 
 template <typename SM>
@@ -196,7 +178,7 @@ void AsyncFizzClientT<SM>::setReplaySafetyCallback(
 }
 
 template <typename SM>
-std::string AsyncFizzClientT<SM>::getApplicationProtocol() noexcept {
+std::string AsyncFizzClientT<SM>::getApplicationProtocol() const noexcept {
   if (earlyDataState_) {
     if (getState().earlyDataParams()->alpn) {
       return *getState().earlyDataParams()->alpn;
@@ -215,7 +197,7 @@ std::string AsyncFizzClientT<SM>::getApplicationProtocol() noexcept {
 template <typename SM>
 void AsyncFizzClientT<SM>::close() {
   if (transport_->good()) {
-    fizzClient_.appClose();
+    fizzClient_.appCloseImmediate();
   } else {
     DelayedDestruction::DestructorGuard dg(this);
     folly::AsyncSocketException ase(
@@ -229,7 +211,7 @@ template <typename SM>
 void AsyncFizzClientT<SM>::closeWithReset() {
   DelayedDestruction::DestructorGuard dg(this);
   if (transport_->good()) {
-    fizzClient_.appClose();
+    fizzClient_.appCloseImmediate();
   }
   folly::AsyncSocketException ase(
       folly::AsyncSocketException::END_OF_FILE, "socket closed locally");
@@ -241,7 +223,7 @@ template <typename SM>
 void AsyncFizzClientT<SM>::closeNow() {
   DelayedDestruction::DestructorGuard dg(this);
   if (transport_->good()) {
-    fizzClient_.appClose();
+    fizzClient_.appCloseImmediate();
   }
   folly::AsyncSocketException ase(
       folly::AsyncSocketException::END_OF_FILE, "socket closed locally");
@@ -276,7 +258,7 @@ void AsyncFizzClientT<SM>::writeAppData(
     folly::AsyncTransportWrapper::WriteCallback* callback,
     std::unique_ptr<folly::IOBuf>&& buf,
     folly::WriteFlags flags) {
-  if (error()) {
+  if (!good()) {
     if (callback) {
       callback->writeErr(
           0,
@@ -370,6 +352,7 @@ void AsyncFizzClientT<SM>::deliverHandshakeError(folly::exception_wrapper ex) {
     callback_ = folly::none;
     folly::variant_match(
         cb,
+        ::fizz::detail::result_type<void>(),
         [this, &ex](HandshakeCallback* callback) {
           callback->fizzHandshakeError(this, std::move(ex));
         },
@@ -399,8 +382,12 @@ void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(DeliverAppData& data) {
 
 template <typename SM>
 void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(WriteToSocket& data) {
-  client_.transport_->writeChain(
-      data.callback, std::move(data.data), data.flags);
+  DCHECK(!data.contents.empty());
+  Buf allData = std::move(data.contents.front().data);
+  for (size_t i = 1; i < data.contents.size(); ++i) {
+    allData->prependChain(std::move(data.contents[i].data));
+  }
+  client_.transport_->writeChain(data.callback, std::move(allData), data.flags);
 }
 
 template <typename SM>
@@ -413,6 +400,7 @@ void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(
     client_.callback_ = folly::none;
     folly::variant_match(
         cb,
+        ::fizz::detail::result_type<void>(),
         [this](HandshakeCallback* callback) {
           callback->fizzHandshakeSuccess(&client_);
         },
@@ -478,6 +466,7 @@ void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(
     client_.callback_ = folly::none;
     folly::variant_match(
         cb,
+        ::fizz::detail::result_type<void>(),
         [this](HandshakeCallback* callback) {
           callback->fizzHandshakeSuccess(&client_);
         },
@@ -541,11 +530,37 @@ void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(
 }
 
 template <typename SM>
+void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(
+    SecretAvailable& secret) {
+  client_.secretAvailable(secret.secret);
+}
+
+template <typename SM>
+void AsyncFizzClientT<SM>::ActionMoveVisitor::operator()(EndOfData&) {
+  folly::AsyncSocketException ase(
+      folly::AsyncSocketException::END_OF_FILE,
+      "remote peer shutdown TLS connection");
+  client_.deliverError(std::move(ase), client_.closeTransportOnCloseNotify());
+}
+
+template <typename SM>
+folly::Optional<CipherSuite> AsyncFizzClientT<SM>::getCipher() const {
+  return getState().cipher();
+}
+
+template <typename SM>
+std::vector<SignatureScheme> AsyncFizzClientT<SM>::getSupportedSigSchemes()
+    const {
+  return getState().context()->getSupportedSigSchemes();
+}
+
+template <typename SM>
 Buf AsyncFizzClientT<SM>::getEkm(
     folly::StringPiece label,
     const Buf& context,
     uint16_t length) const {
-  return fizzClient_.getEkm(label, context, length);
+  return fizzClient_.getEkm(
+      *fizzContext_->getFactory(), label, context, length);
 }
 
 template <typename SM>
@@ -553,7 +568,8 @@ Buf AsyncFizzClientT<SM>::getEarlyEkm(
     folly::StringPiece label,
     const Buf& context,
     uint16_t length) const {
-  return fizzClient_.getEarlyEkm(label, context, length);
+  return fizzClient_.getEarlyEkm(
+      *fizzContext_->getFactory(), label, context, length);
 }
 
 template <typename SM>

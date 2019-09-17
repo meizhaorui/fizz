@@ -23,11 +23,34 @@ class Protocol {
       folly::ByteRange secret,
       const Factory& factory,
       const KeyScheduler& scheduler) {
+    auto aead = deriveRecordAead(factory, scheduler, cipher, secret);
+    recordLayer.setAead(secret, std::move(aead));
+  }
+
+  static std::unique_ptr<Aead> deriveRecordAead(
+      const Factory& factory,
+      const KeyScheduler& scheduler,
+      CipherSuite cipher,
+      folly::ByteRange secret) {
     auto aead = factory.makeAead(cipher);
     auto trafficKey =
         scheduler.getTrafficKey(secret, aead->keyLength(), aead->ivLength());
     aead->setKey(std::move(trafficKey));
-    recordLayer.setAead(std::move(aead));
+    return aead;
+  }
+
+  static std::unique_ptr<Aead> deriveRecordAeadWithLabel(
+      const Factory& factory,
+      const KeyScheduler& scheduler,
+      CipherSuite cipher,
+      folly::ByteRange secret,
+      folly::StringPiece keyLabel,
+      folly::StringPiece ivLabel) {
+    auto aead = factory.makeAead(cipher);
+    auto trafficKey = scheduler.getTrafficKeyWithLabel(
+        secret, keyLabel, ivLabel, aead->keyLength(), aead->ivLength());
+    aead->setKey(std::move(trafficKey));
+    return aead;
   }
 
   static Buf getFinished(
@@ -55,7 +78,6 @@ class Protocol {
       switch (ext.extension_type) {
         case ExtensionType::signature_algorithms:
         case ExtensionType::key_share:
-        case ExtensionType::key_share_old:
         case ExtensionType::pre_shared_key:
         case ExtensionType::psk_key_exchange_modes:
         case ExtensionType::cookie:
@@ -87,7 +109,6 @@ class Protocol {
               requestedExtensions.end(),
               ext.extension_type) == requestedExtensions.end() ||
           (ext.extension_type != ExtensionType::key_share &&
-           ext.extension_type != ExtensionType::key_share_old &&
            ext.extension_type != ExtensionType::pre_shared_key &&
            ext.extension_type != ExtensionType::supported_versions)) {
         throw FizzException(
@@ -104,7 +125,6 @@ class Protocol {
     for (const auto& ext : hrr.extensions) {
       if (ext.extension_type != ExtensionType::cookie &&
           ext.extension_type != ExtensionType::key_share &&
-          ext.extension_type != ExtensionType::key_share_old &&
           ext.extension_type != ExtensionType::supported_versions) {
         throw FizzException(
             "unexpected extension in hrr: " + toString(ext.extension_type),

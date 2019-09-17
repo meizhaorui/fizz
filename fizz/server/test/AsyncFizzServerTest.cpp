@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/server/AsyncFizzServer.h>
 
@@ -63,7 +63,26 @@ class AsyncFizzServerTest : public Test {
     EXPECT_CALL(*machine_, _processAppClose(_))
         .WillOnce(InvokeWithoutArgs([]() {
           WriteToSocket write;
-          write.data = IOBuf::copyBuffer("closenotify");
+          TLSContent record;
+          record.contentType = ContentType::alert;
+          record.encryptionLevel = EncryptionLevel::Handshake;
+          record.data = IOBuf::copyBuffer("closenotify");
+          write.contents.emplace_back(std::move(record));
+          return detail::actions(
+              [](State& newState) { newState.state() = StateEnum::Error; },
+              std::move(write));
+        }));
+  }
+
+  void expectAppCloseImmediate() {
+    EXPECT_CALL(*machine_, _processAppCloseImmediate(_))
+        .WillOnce(InvokeWithoutArgs([]() {
+          WriteToSocket write;
+          TLSContent record;
+          record.contentType = ContentType::alert;
+          record.encryptionLevel = EncryptionLevel::Handshake;
+          record.data = IOBuf::copyBuffer("closenotify");
+          write.contents.emplace_back(std::move(record));
           return detail::actions(
               [](State& newState) { newState.state() = StateEnum::Error; },
               std::move(write));
@@ -170,6 +189,13 @@ TEST_F(AsyncFizzServerTest, TestWriteErrorState) {
   server_->writeChain(&writeCallback_, IOBuf::copyBuffer("test"));
 }
 
+TEST_F(AsyncFizzServerTest, TestWriteNotGoodState) {
+  accept();
+  ON_CALL(*socket_, good()).WillByDefault(Return(false));
+  EXPECT_CALL(writeCallback_, writeErr_(0, _));
+  server_->writeChain(&writeCallback_, IOBuf::copyBuffer("test"));
+}
+
 TEST_F(AsyncFizzServerTest, TestHandshake) {
   completeHandshake();
 }
@@ -205,13 +231,33 @@ TEST_F(AsyncFizzServerTest, TestDeliverAppData) {
   socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("ClientHello"));
 }
 
+TEST_F(AsyncFizzServerTest, TestSendTicketWithAppToken) {
+  completeHandshake();
+  EXPECT_CALL(*machine_, _processWriteNewSessionTicket(_, _))
+      .WillOnce(InvokeWithoutArgs([]() {
+        WriteToSocket write;
+        TLSContent record;
+        record.contentType = ContentType::handshake;
+        record.encryptionLevel = EncryptionLevel::AppTraffic;
+        record.data = IOBuf::copyBuffer("XYZ");
+        write.contents.emplace_back(std::move(record));
+        return actions(std::move(write));
+      }));
+  EXPECT_CALL(*socket_, writeChain(_, _, _));
+  server_->sendTicketWithAppToken(IOBuf::copyBuffer("testAppToken"));
+}
+
 TEST_F(AsyncFizzServerTest, TestWriteToSocket) {
   completeHandshake();
   server_->setReadCB(&readCallback_);
   EXPECT_CALL(*machine_, _processSocketData(_, _))
       .WillOnce(InvokeWithoutArgs([]() {
         WriteToSocket write;
-        write.data = IOBuf::copyBuffer("XYZ");
+        TLSContent record;
+        record.contentType = ContentType::application_data;
+        record.encryptionLevel = EncryptionLevel::AppTraffic;
+        record.data = IOBuf::copyBuffer("XYZ");
+        write.contents.emplace_back(std::move(record));
         return actions(std::move(write), WaitForData());
       }));
   EXPECT_CALL(*socket_, writeChain(_, _, _));
@@ -273,7 +319,7 @@ TEST_F(AsyncFizzServerTest, TestDeleteAsyncEvent) {
 
 TEST_F(AsyncFizzServerTest, TestCloseHandshake) {
   accept();
-  expectAppClose();
+  expectAppCloseImmediate();
   EXPECT_CALL(handshakeCallback_, _fizzHandshakeError(_));
   EXPECT_CALL(*socket_, closeNow()).Times(AtLeast(1));
   server_->closeNow();
@@ -308,7 +354,7 @@ TEST_F(AsyncFizzServerTest, TestCloseInFlightAction) {
 
   EXPECT_CALL(*machine_, _processAppWrite(_, _))
       .WillOnce(InvokeWithoutArgs([]() { return actions(); }));
-  expectAppClose();
+  expectAppCloseImmediate();
   p.setValue(detail::actions(WaitForData()));
 }
 
@@ -382,17 +428,53 @@ TEST_F(AsyncFizzServerTest, TestErrorStopsActions) {
   completeHandshake();
   server_->setReadCB(&readCallback_);
   EXPECT_CALL(*machine_, _processSocketData(_, _))
-      .WillOnce(InvokeWithoutArgs(
-          []() { return actions(ReportError("unit test")); }));
+      .WillOnce(InvokeWithoutArgs([]() {
+        return actions(
+            [](State& newState) { newState.state() = StateEnum::Error; },
+            ReportError("unit test"));
+      }));
   EXPECT_FALSE(server_->error());
+  EXPECT_TRUE(server_->good());
   socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
   EXPECT_TRUE(server_->error());
+  EXPECT_FALSE(server_->good());
+}
+
+TEST_F(AsyncFizzServerTest, TestTransportError) {
+  completeHandshake();
+  server_->setReadCB(&readCallback_);
+  EXPECT_CALL(*machine_, _processSocketData(_, _)).Times(0);
+  EXPECT_FALSE(server_->error());
+  EXPECT_TRUE(server_->good());
+  ON_CALL(*socket_, error()).WillByDefault(Return(true));
+  AsyncSocketException ase(AsyncSocketException::UNKNOWN, "unit test");
+  socketReadCallback_->readErr(ase);
+  EXPECT_TRUE(server_->error());
+  EXPECT_FALSE(server_->good());
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
+  EXPECT_TRUE(server_->error());
+  EXPECT_FALSE(server_->good());
+}
+
+TEST_F(AsyncFizzServerTest, TestTransportEof) {
+  completeHandshake();
+  server_->setReadCB(&readCallback_);
+  EXPECT_CALL(*machine_, _processSocketData(_, _)).Times(0);
+  EXPECT_FALSE(server_->error());
+  EXPECT_TRUE(server_->good());
+  ON_CALL(*socket_, good()).WillByDefault(Return(false));
+  socketReadCallback_->readEOF();
+  EXPECT_FALSE(server_->error());
+  EXPECT_FALSE(server_->good());
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
+  EXPECT_FALSE(server_->error());
+  EXPECT_FALSE(server_->good());
 }
 
 TEST_F(AsyncFizzServerTest, TestGetCertsNone) {
   completeHandshake();
-  EXPECT_EQ(server_->getSelfCert(), nullptr);
-  EXPECT_EQ(server_->getPeerCert(), nullptr);
+  EXPECT_EQ(server_->getSelfCertificate(), nullptr);
+  EXPECT_EQ(server_->getPeerCertificate(), nullptr);
 }
 
 TEST_F(AsyncFizzServerTest, TestGetCerts) {
@@ -401,11 +483,51 @@ TEST_F(AsyncFizzServerTest, TestGetCerts) {
   accept();
   EXPECT_CALL(handshakeCallback_, _fizzHandshakeSuccess());
   fullHandshakeSuccess(clientCert, serverCert);
-  EXPECT_CALL(*serverCert, getX509());
-  EXPECT_EQ(server_->getSelfCert(), nullptr);
-  EXPECT_CALL(*clientCert, getX509());
-  EXPECT_EQ(server_->getPeerCert(), nullptr);
+  EXPECT_NE(server_->getSelfCertificate(), nullptr);
+  EXPECT_NE(server_->getPeerCertificate(), nullptr);
 }
+
+TEST_F(AsyncFizzServerTest, TestTransportNotGoodOnSuccess) {
+  accept();
+  EXPECT_CALL(handshakeCallback_, _fizzHandshakeError(_));
+  EXPECT_CALL(*machine_, _processSocketData(_, _))
+      .WillOnce(InvokeWithoutArgs([&]() {
+        // Make the socket return not good
+        EXPECT_CALL(*socket_, good()).WillOnce(Return(false));
+        return actions(ReportHandshakeSuccess());
+      }));
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("ClientHello"));
+  EXPECT_FALSE(server_->good());
+}
+
+TEST_F(AsyncFizzServerTest, TestTransportNotGoodOnEarlySuccess) {
+  accept();
+  EXPECT_CALL(handshakeCallback_, _fizzHandshakeError(_));
+  EXPECT_CALL(*machine_, _processSocketData(_, _))
+      .WillOnce(InvokeWithoutArgs([&]() {
+        // Make the socket return not good
+        EXPECT_CALL(*socket_, good()).WillOnce(Return(false));
+        return actions(ReportEarlyHandshakeSuccess());
+      }));
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("ClientHello"));
+  EXPECT_FALSE(server_->good());
+}
+
+TEST_F(AsyncFizzServerTest, TestRemoteClosed) {
+  completeHandshake();
+  server_->setReadCB(&readCallback_);
+  EXPECT_CALL(readCallback_, readEOF_());
+  EXPECT_CALL(*machine_, _processSocketData(_, _))
+      .WillOnce(InvokeWithoutArgs([]() {
+        return actions(
+            [](State& s) { s.state() = StateEnum::Closed; }, EndOfData());
+      }));
+  EXPECT_CALL(*socket_, closeNow());
+  EXPECT_TRUE(server_->good());
+  socketReadCallback_->readBufferAvailable(IOBuf::copyBuffer("Data"));
+  EXPECT_FALSE(server_->good());
+}
+
 } // namespace test
 } // namespace server
 } // namespace fizz

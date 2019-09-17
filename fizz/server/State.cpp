@@ -8,9 +8,9 @@
 
 #include <fizz/server/State.h>
 
-using fizz::server::StateEnum;
 
 namespace fizz {
+namespace server {
 
 folly::StringPiece toString(StateEnum state) {
   switch (state) {
@@ -28,6 +28,8 @@ folly::StringPiece toString(StateEnum state) {
       return "ExpectingFinished";
     case StateEnum::AcceptingData:
       return "AcceptingData";
+    case StateEnum::ExpectingCloseNotify:
+      return "ExpectingCloseNotify";
     case StateEnum::Closed:
       return "Closed";
     case StateEnum::Error:
@@ -37,4 +39,5 @@ folly::StringPiece toString(StateEnum state) {
   }
   return "Invalid state";
 }
+} // namespace server
 } // namespace fizz

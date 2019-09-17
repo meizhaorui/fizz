@@ -8,6 +8,8 @@
 
 #pragma once
 
+#include <fizz/protocol/KeyScheduler.h>
+#include <fizz/record/Types.h>
 #include <folly/io/IOBufQueue.h>
 #include <folly/io/async/AsyncSocket.h>
 #include <folly/io/async/WriteChainAsyncTransportWrapper.h>
@@ -23,7 +25,7 @@ using Cert = folly::AsyncTransportCertificate;
 class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
                           folly::AsyncTransportWrapper>,
                       protected folly::AsyncTransportWrapper::WriteCallback,
-                      private folly::AsyncTransportWrapper::ReadCallback {
+                      protected folly::AsyncTransportWrapper::ReadCallback {
  public:
   using UniquePtr =
       std::unique_ptr<AsyncFizzBase, folly::DelayedDestruction::Destructor>;
@@ -42,6 +44,34 @@ class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
 
    private:
     AsyncFizzBase& transport_;
+  };
+
+  class SecretCallback {
+   public:
+    virtual ~SecretCallback() = default;
+    /**
+     * Each of the below is called when the corresponding secret is received.
+     */
+    virtual void externalPskBinderAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void resumptionPskBinderAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void earlyExporterSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void clientEarlyTrafficSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void clientHandshakeTrafficSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void serverHandshakeTrafficSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void exporterMasterSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void resumptionMasterSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void clientAppTrafficSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
+    virtual void serverAppTrafficSecretAvailable(
+        const std::vector<uint8_t>&) noexcept {}
   };
 
   explicit AsyncFizzBase(folly::AsyncTransportWrapper::UniquePtr transport);
@@ -74,13 +104,6 @@ class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
   bool error() const override = 0;
 
   /**
-   * Information about the current security state.
-   * To be implemented by derived classes.
-   */
-  folly::ssl::X509UniquePtr getPeerCert() const override = 0;
-  const X509* getSelfCert() const override = 0;
-
-  /**
    * Get the certificates in fizz::Cert form.
    */
   const Cert* getPeerCertificate() const override = 0;
@@ -90,7 +113,25 @@ class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
   bool isReplaySafe() const override = 0;
   void setReplaySafetyCallback(
       folly::AsyncTransport::ReplaySafetyCallback* callback) override = 0;
-  std::string getApplicationProtocol() noexcept override = 0;
+  std::string getApplicationProtocol() const noexcept override = 0;
+
+  /**
+   * Get the CipherSuite negotiated in this transport.
+   */
+  virtual folly::Optional<CipherSuite> getCipher() const = 0;
+
+  /**
+   * Get the supported signature schemes in this transport.
+   */
+  virtual std::vector<SignatureScheme> getSupportedSigSchemes() const = 0;
+
+  /**
+   * Get the exported material.
+   */
+  virtual Buf getEkm(
+      folly::StringPiece label,
+      const Buf& context,
+      uint16_t length) const = 0;
 
   /**
    * Clean up transport on destruction
@@ -141,6 +182,34 @@ class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
     return result;
   }
 
+  void setSecretCallback(SecretCallback* cb) {
+    secretCallback_ = cb;
+  }
+
+  SecretCallback* getSecretCallback() {
+    return secretCallback_;
+  }
+
+  /**
+   * Behavior tunables
+   */
+
+  /**
+   * setCloseTransportOnCloseNotify() defines the behavior taken when the remote
+   * peer sends us a close_notify alert, signaling their intention to tear
+   * down the TLS session.
+   *
+   * By default, upon receipt of a close_notify alert, we will immediately
+   * tear down the transport without responding with our own close_notify.
+   */
+  void setCloseTransportOnCloseNotify(bool flag) {
+    closeTransportOnCloseNotify_ = flag;
+  }
+
+  bool closeTransportOnCloseNotify() const {
+    return closeTransportOnCloseNotify_;
+  }
+
  protected:
   /**
    * Start reading raw data from the transport.
@@ -184,6 +253,11 @@ class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
    */
   virtual void transportDataAvailable() = 0;
 
+  /**
+   * Allows the derived class to give a derived secret to the secret callback.
+   */
+  virtual void secretAvailable(const DerivedSecret& secret) noexcept;
+
   folly::IOBufQueue transportReadBuf_{folly::IOBufQueue::cacheChainLength()};
 
  private:
@@ -217,5 +291,8 @@ class AsyncFizzBase : public folly::WriteChainAsyncTransportWrapper<
   size_t appBytesReceived_{0};
 
   HandshakeTimeout handshakeTimeout_;
+
+  bool closeTransportOnCloseNotify_{true};
+  SecretCallback* secretCallback_{nullptr};
 };
 } // namespace fizz

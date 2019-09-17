@@ -6,15 +6,13 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gtest/gtest.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/crypto/openssl/OpenSSLKeyUtils.h>
 #include <fizz/crypto/test/TestUtil.h>
 
 #include <folly/String.h>
 
-using namespace folly;
-using namespace folly::ssl;
 
 namespace fizz {
 namespace test {

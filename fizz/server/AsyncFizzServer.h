@@ -39,7 +39,7 @@ class AsyncFizzServerT : public AsyncFizzBase {
 
   AsyncFizzServerT(
       folly::AsyncTransportWrapper::UniquePtr socket,
-      const std::shared_ptr<FizzServerContext>& fizzContext,
+      const std::shared_ptr<const FizzServerContext>& fizzContext,
       const std::shared_ptr<ServerExtensions>& extensions = nullptr);
 
   virtual void accept(HandshakeCallback* callback);
@@ -51,12 +51,10 @@ class AsyncFizzServerT : public AsyncFizzBase {
   bool isDetachable() const override;
   void attachEventBase(folly::EventBase* evb) override;
 
-  folly::ssl::X509UniquePtr getPeerCert() const override;
-  const X509* getSelfCert() const override;
   bool isReplaySafe() const override;
   void setReplaySafetyCallback(
       folly::AsyncTransport::ReplaySafetyCallback* callback) override;
-  std::string getApplicationProtocol() noexcept override;
+  std::string getApplicationProtocol() const noexcept override;
 
   void close() override;
   void closeWithReset() override;
@@ -69,10 +67,20 @@ class AsyncFizzServerT : public AsyncFizzBase {
     return state_;
   }
 
-  virtual Buf getEkm(
+  /**
+   * Exposes API for application to send client a new session ticket containing
+   * the provided appToken.
+   */
+  void sendTicketWithAppToken(Buf appToken);
+
+  folly::Optional<CipherSuite> getCipher() const override;
+
+  std::vector<SignatureScheme> getSupportedSigSchemes() const override;
+
+  Buf getEkm(
       folly::StringPiece label,
       const Buf& hashedContext,
-      uint16_t length) const;
+      uint16_t length) const override;
 
   virtual Buf getEarlyEkm(
       folly::StringPiece label,
@@ -83,6 +91,7 @@ class AsyncFizzServerT : public AsyncFizzBase {
   const Cert* getSelfCertificate() const override;
 
  protected:
+  ~AsyncFizzServerT() override = default;
   void writeAppData(
       folly::AsyncTransportWrapper::WriteCallback* callback,
       std::unique_ptr<folly::IOBuf>&& buf,
@@ -111,6 +120,8 @@ class AsyncFizzServerT : public AsyncFizzBase {
     void operator()(WaitForData&);
     void operator()(MutateState&);
     void operator()(AttemptVersionFallback&);
+    void operator()(SecretAvailable&);
+    void operator()(EndOfData&);
 
    private:
     AsyncFizzServerT<SM>& server_;
@@ -118,7 +129,7 @@ class AsyncFizzServerT : public AsyncFizzBase {
 
   HandshakeCallback* handshakeCallback_{nullptr};
 
-  std::shared_ptr<FizzServerContext> fizzContext_;
+  std::shared_ptr<const FizzServerContext> fizzContext_;
 
   std::shared_ptr<ServerExtensions> extensions_;
 

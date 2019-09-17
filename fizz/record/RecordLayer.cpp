@@ -15,8 +15,6 @@ using HandshakeTypeType = typename std::underlying_type<HandshakeType>::type;
 static constexpr size_t kHandshakeHeaderSize =
     sizeof(HandshakeType) + detail::bits24::size;
 
-static constexpr size_t kMaxHandshakeSize = 0x20000; // 128k
-
 folly::Optional<Param> ReadRecordLayer::readEvent(
     folly::IOBufQueue& socketBuf) {
   if (!unparsedHandshakeData_.empty()) {
@@ -42,10 +40,43 @@ folly::Optional<Param> ReadRecordLayer::readEvent(
     }
 
     switch (message->type) {
-      case ContentType::alert:
-        return Param(decode<Alert>(std::move(message->fragment)));
+      case ContentType::alert: {
+        auto alert = decode<Alert>(std::move(message->fragment));
+        if (alert.description == AlertDescription::close_notify) {
+          return Param(CloseNotify(socketBuf.move()));
+        } else {
+          return Param(std::move(alert));
+        }
+      }
       case ContentType::handshake: {
-        unparsedHandshakeData_.append(std::move(message->fragment));
+        std::unique_ptr<folly::IOBuf> handshakeMessage =
+            unparsedHandshakeData_.move();
+        // It is possible that a peer might send us records in a manner such
+        // that there is a 16KB record and only 1 byte of handshake message in
+        // each record. Since we normally just trim the IOBuf, we would end up
+        // holding 16K of data. To prevent this we allocate a contiguous
+        // buffer to copy over these bytes. We supply kExtraAlloc bytes in
+        // order to avoid needing to re-allocate a lot of times if we receive
+        // a lot of small messages. There might be more optimal reallocation
+        // policies, but this should be fine.
+        message->fragment->coalesce();
+        constexpr size_t kExtraAlloc = 1024;
+        if (!handshakeMessage) {
+          handshakeMessage =
+              folly::IOBuf::create(message->fragment->length() + kExtraAlloc);
+        } else if (handshakeMessage->tailroom() < message->fragment->length()) {
+          // There might be remaining bytes from the previous handshake that are
+          // left over in the unparsedHandshakeData_ buffer.
+          handshakeMessage->unshare();
+          handshakeMessage->reserve(
+              0, message->fragment->length() + kExtraAlloc);
+        }
+        memcpy(
+            handshakeMessage->writableTail(),
+            message->fragment->data(),
+            message->fragment->length());
+        handshakeMessage->append(message->fragment->length());
+        unparsedHandshakeData_.append(std::move(handshakeMessage));
         auto param = decodeHandshakeMessage(unparsedHandshakeData_);
         if (param) {
           VLOG(8) << "Received handshake message "
@@ -131,6 +162,9 @@ folly::Optional<Param> ReadRecordLayer::decodeHandshakeMessage(
           std::move(handshakeMsg), std::move(original));
     case HandshakeType::certificate:
       return parse<CertificateMsg>(
+          std::move(handshakeMsg), std::move(original));
+    case HandshakeType::compressed_certificate:
+      return parse<CompressedCertificate>(
           std::move(handshakeMsg), std::move(original));
     case HandshakeType::certificate_request:
       return parse<CertificateRequest>(

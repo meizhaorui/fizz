@@ -9,8 +9,11 @@
 #pragma once
 
 #include <fizz/client/PskCache.h>
+#include <fizz/protocol/CertDecompressionManager.h>
 #include <fizz/protocol/Certificate.h>
 #include <fizz/protocol/Factory.h>
+#include <fizz/protocol/OpenSSLFactory.h>
+#include <fizz/protocol/clock/SystemClock.h>
 #include <fizz/record/Types.h>
 
 namespace fizz {
@@ -18,7 +21,11 @@ namespace client {
 
 class FizzClientContext {
  public:
-  FizzClientContext() : factory_(std::make_unique<Factory>()) {}
+  FizzClientContext()
+      : factory_(std::make_shared<OpenSSLFactory>()),
+        clock_(std::make_shared<SystemClock>()) {}
+  FizzClientContext(std::shared_ptr<Factory> factory)
+      : factory_(std::move(factory)), clock_(std::make_shared<SystemClock>()) {}
   virtual ~FizzClientContext() = default;
 
   /**
@@ -159,21 +166,9 @@ class FizzClientContext {
   }
 
   /**
-   * Sets whether to use an alternate SNI code point. This is a temporary
-   * experiment to measure any SNI filtering.
-   */
-  void setUseAlternateSniCodePoint(bool enabled) {
-    useAlternateSniCodePoint_ = enabled;
-  }
-
-  bool getUseAlternateSniCodePoint() const {
-    return useAlternateSniCodePoint_;
-  }
-
-  /**
    * Set the factory to use. Should generally only be changed for testing.
    */
-  void setFactory(std::unique_ptr<Factory> factory) {
+  void setFactory(std::shared_ptr<Factory> factory) {
     factory_ = std::move(factory);
   }
 
@@ -181,17 +176,82 @@ class FizzClientContext {
     return factory_.get();
   }
 
- private:
-  std::unique_ptr<Factory> factory_;
+  /**
+   * Sets the certificate decompression manager for server certs.
+   */
+  void setCertDecompressionManager(
+      std::shared_ptr<CertDecompressionManager> mgr) {
+    certDecompressionManager_ = mgr;
+  }
 
-  std::vector<ProtocolVersion> supportedVersions_ = {
-      ProtocolVersion::tls_1_3_26};
+  /**
+   * Returns a vector representing the compression algorithms the manager has
+   * decompressors for.
+   */
+  std::vector<CertificateCompressionAlgorithm>
+  getSupportedCertDecompressionAlgorithms() const {
+    if (certDecompressionManager_) {
+      return certDecompressionManager_->getSupportedAlgorithms();
+    } else {
+      return {};
+    }
+  }
+
+  /**
+   * Given a compression algorithm, returns the decompressor to decompress
+   * certs. If the algorithm isn't found, returns nullptr.
+   */
+  std::shared_ptr<CertificateDecompressor> getCertDecompressorForAlgorithm(
+      CertificateCompressionAlgorithm algo) const {
+    if (certDecompressionManager_) {
+      return certDecompressionManager_->getDecompressor(algo);
+    } else {
+      return nullptr;
+    }
+  }
+
+  /**
+   * Whether to omit the early record layer when sending early data. This will
+   * also omit the EndOfEarlyData message.
+   * Default is false, and using this requires a custom record layer.
+   */
+  void setOmitEarlyRecordLayer(bool enabled) {
+    omitEarlyRecordLayer_ = enabled;
+  }
+  bool getOmitEarlyRecordLayer() const {
+    return omitEarlyRecordLayer_;
+  }
+
+  /**
+   * Controls the maximum age of a ticket's original handshake (i.e. the full
+   * handshake that originally authenticated the initial connection) before
+   * it's invalidated and removed from the cache.
+   */
+  void setMaxPskHandshakeLife(std::chrono::seconds life) {
+    maxPskHandshakeLife_ = life;
+  }
+  std::chrono::seconds getMaxPskHandshakeLife() const {
+    return maxPskHandshakeLife_;
+  }
+
+  void setClock(std::shared_ptr<Clock> clock) {
+    clock_ = clock;
+  }
+
+  std::shared_ptr<Clock> getClock() const {
+    return clock_;
+  }
+
+ private:
+  std::shared_ptr<Factory> factory_;
+
+  std::vector<ProtocolVersion> supportedVersions_ = {ProtocolVersion::tls_1_3};
   std::vector<CipherSuite> supportedCiphers_ = {
       CipherSuite::TLS_AES_128_GCM_SHA256,
       CipherSuite::TLS_AES_256_GCM_SHA384,
-#if FOLLY_OPENSSL_IS_110
+#if FOLLY_OPENSSL_HAS_CHACHA
       CipherSuite::TLS_CHACHA20_POLY1305_SHA256,
-#endif // FOLLY_OPENSSL_IS_110
+#endif // FOLLY_OPENSSL_HAS_CHACHA
   };
   std::vector<SignatureScheme> supportedSigSchemes_ = {
       SignatureScheme::ecdsa_secp256r1_sha256,
@@ -207,10 +267,14 @@ class FizzClientContext {
 
   bool compatMode_{false};
 
+  bool omitEarlyRecordLayer_{false};
+
   std::shared_ptr<PskCache> pskCache_;
   std::shared_ptr<const SelfCert> clientCert_;
+  std::shared_ptr<CertDecompressionManager> certDecompressionManager_;
+  std::shared_ptr<Clock> clock_;
 
-  bool useAlternateSniCodePoint_{false};
+  std::chrono::seconds maxPskHandshakeLife_{std::chrono::hours(168)};
 };
 } // namespace client
 } // namespace fizz

@@ -6,17 +6,14 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/record/Extensions.h>
 #include <folly/String.h>
 
 using namespace folly;
-using namespace folly::io;
 
-using testing::_;
-using namespace testing;
 
 // Real client hello captured from
 // firefox nightly
@@ -80,6 +77,8 @@ static const std::string nst =
 static const std::string encodedKeyUpdate = "00";
 
 static const std::string encodedCertRequest = "00000a000d0006000406030807";
+
+static const std::string encodedCompressedCertificate = "000100face000009666f6f62617262617a";
 
 namespace fizz {
 namespace test {
@@ -251,6 +250,17 @@ TEST_F(HandshakeTypesTest, EncodedAndDecodeCertificateRequest) {
   EXPECT_TRUE(getExtension<SignatureAlgorithms>(cr.extensions).hasValue());
   auto reencoded = encodeHex(std::move(cr));
   EXPECT_EQ(reencoded, encodedCertRequest);
+}
+
+TEST_F(HandshakeTypesTest, EncodeAndDecodeCompressedCertificate) {
+  auto cc = decodeHex<CompressedCertificate>(encodedCompressedCertificate);
+  EXPECT_EQ(cc.algorithm, CertificateCompressionAlgorithm::zlib);
+  EXPECT_EQ(cc.uncompressed_length, 0x00face);
+  EXPECT_EQ(
+      StringPiece(cc.compressed_certificate_message->coalesce()),
+      StringPiece("foobarbaz"));
+  auto reencoded = encodeHex(std::move(cc));
+  EXPECT_EQ(reencoded, encodedCompressedCertificate);
 }
 } // namespace test
 } // namespace fizz

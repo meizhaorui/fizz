@@ -6,8 +6,8 @@
  *  LICENSE file in the root directory of this source tree.
  */
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 #include <fizz/record/RecordLayer.h>
 #include <fizz/record/test/Mocks.h>
@@ -15,7 +15,6 @@
 #include <folly/String.h>
 
 using namespace folly;
-using namespace folly::io;
 
 using testing::_;
 using namespace testing;
@@ -30,8 +29,8 @@ class ConcreteReadRecordLayer : public PlaintextReadRecordLayer {
 
 class ConcreteWriteRecordLayer : public PlaintextWriteRecordLayer {
  public:
-  MOCK_CONST_METHOD1(_write, Buf(TLSMessage& msg));
-  Buf write(TLSMessage&& msg) const override {
+  MOCK_CONST_METHOD1(_write, TLSContent(TLSMessage& msg));
+  TLSContent write(TLSMessage&& msg) const override {
     return _write(msg);
   }
 };
@@ -154,26 +153,65 @@ TEST_F(RecordTest, TestHandshakeSpliced) {
   EXPECT_ANY_THROW(read_.readEvent(queue_));
 }
 
+TEST_F(RecordTest, TestMultipleHandshakeMessages) {
+  EXPECT_CALL(read_, read(_))
+      .WillOnce(InvokeWithoutArgs([]() {
+        return TLSMessage{ContentType::handshake,
+                          getBuf("14000002aabb14000002")};
+      }))
+      .WillOnce(InvokeWithoutArgs([]() {
+        // Really large message to force the record layer to
+        // allocate more space as well the tail end of the previous
+        // finished message
+        auto message = getBuf("ccdd");
+        for (size_t i = 0; i < 1000; ++i) {
+          message->prependChain(getBuf("14000002aabb"));
+        }
+        message->coalesce();
+        return TLSMessage{ContentType::handshake, std::move(message)};
+      }));
+  auto param = read_.readEvent(queue_);
+  auto& finished = boost::get<Finished>(*param);
+  expectSame(finished.verify_data, "aabb");
+  EXPECT_TRUE(read_.hasUnparsedHandshakeData());
+  param = read_.readEvent(queue_);
+  auto& finished2 = boost::get<Finished>(*param);
+  expectSame(finished2.verify_data, "ccdd");
+  EXPECT_TRUE(read_.hasUnparsedHandshakeData());
+}
+
 TEST_F(RecordTest, TestWriteAppData) {
-  EXPECT_CALL(write_, _write(_)).WillOnce(Invoke([](TLSMessage& msg) {
+  EXPECT_CALL(write_, _write(_)).WillOnce(Invoke([&](TLSMessage& msg) {
+    TLSContent content;
+    content.contentType = msg.type;
+    content.encryptionLevel = write_.getEncryptionLevel();
+    content.data = nullptr;
     EXPECT_EQ(msg.type, ContentType::application_data);
-    return nullptr;
+    return content;
   }));
   write_.writeAppData(IOBuf::copyBuffer("hi"));
 }
 
 TEST_F(RecordTest, TestWriteAlert) {
-  EXPECT_CALL(write_, _write(_)).WillOnce(Invoke([](TLSMessage& msg) {
+  EXPECT_CALL(write_, _write(_)).WillOnce(Invoke([&](TLSMessage& msg) {
     EXPECT_EQ(msg.type, ContentType::alert);
-    return nullptr;
+    TLSContent content;
+    content.contentType = msg.type;
+    content.encryptionLevel = write_.getEncryptionLevel();
+    content.data = nullptr;
+    return content;
   }));
   write_.writeAlert(Alert());
 }
 
 TEST_F(RecordTest, TestWriteHandshake) {
-  EXPECT_CALL(write_, _write(_)).WillOnce(Invoke([](TLSMessage& msg) {
+  EXPECT_CALL(write_, _write(_)).WillOnce(Invoke([&](TLSMessage& msg) {
     EXPECT_EQ(msg.type, ContentType::handshake);
-    return nullptr;
+    TLSContent content;
+    content.contentType = msg.type;
+    content.encryptionLevel = write_.getEncryptionLevel();
+    content.data = nullptr;
+    return content;
   }));
   write_.writeHandshake(IOBuf::copyBuffer("msg1"), IOBuf::copyBuffer("msg2"));
 }

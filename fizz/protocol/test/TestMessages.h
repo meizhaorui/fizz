@@ -85,10 +85,10 @@ struct TestMessages {
     return chlo;
   }
 
-  static ClientHello clientHelloPskEarly() {
+  static ClientHello clientHelloPskEarly(uint32_t ticketAge = 100000) {
     auto chlo = clientHello();
     chlo.extensions.push_back(encodeExtension(ClientEarlyData()));
-    addPsk(chlo);
+    addPsk(chlo, ticketAge);
     return chlo;
   }
 
@@ -160,6 +160,16 @@ struct TestMessages {
     certificate.certificate_request_context = folly::IOBuf::copyBuffer("");
     certificate.originalEncoding = folly::IOBuf::copyBuffer("certencoding");
     return certificate;
+  }
+
+  static CompressedCertificate compressedCertificate() {
+    CompressedCertificate cc;
+    cc.algorithm = CertificateCompressionAlgorithm::zlib;
+    cc.uncompressed_length = 0x111111;
+    cc.compressed_certificate_message =
+        folly::IOBuf::copyBuffer("compressedcerts");
+    cc.originalEncoding = folly::IOBuf::copyBuffer("compcertencoding");
+    return cc;
   }
 
   static CertificateVerify certificateVerify() {

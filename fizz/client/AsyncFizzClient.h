@@ -95,16 +95,13 @@ class AsyncFizzClientT : public AsyncFizzBase,
   bool connecting() const override;
   bool error() const override;
 
-  folly::ssl::X509UniquePtr getPeerCert() const override;
-  const X509* getSelfCert() const override;
-
   const Cert* getPeerCertificate() const override;
   const Cert* getSelfCertificate() const override;
 
   bool isReplaySafe() const override;
   void setReplaySafetyCallback(
       folly::AsyncTransport::ReplaySafetyCallback* callback) override;
-  std::string getApplicationProtocol() noexcept override;
+  std::string getApplicationProtocol() const noexcept override;
 
   void close() override;
   void closeWithReset() override;
@@ -128,8 +125,12 @@ class AsyncFizzClientT : public AsyncFizzBase,
     return state_;
   }
 
+  folly::Optional<CipherSuite> getCipher() const override;
+
+  std::vector<SignatureScheme> getSupportedSigSchemes() const override;
+
   Buf getEkm(folly::StringPiece label, const Buf& context, uint16_t length)
-      const;
+      const override;
 
   Buf getEarlyEkm(folly::StringPiece label, const Buf& context, uint16_t length)
       const;
@@ -137,6 +138,7 @@ class AsyncFizzClientT : public AsyncFizzBase,
   bool pskResumed() const;
 
  protected:
+  ~AsyncFizzClientT() override = default;
   void writeAppData(
       folly::AsyncTransportWrapper::WriteCallback* callback,
       std::unique_ptr<folly::IOBuf>&& buf,
@@ -171,6 +173,8 @@ class AsyncFizzClientT : public AsyncFizzBase,
     void operator()(WaitForData&);
     void operator()(MutateState&);
     void operator()(NewCachedPsk&);
+    void operator()(SecretAvailable&);
+    void operator()(EndOfData&);
 
    private:
     AsyncFizzClientT<SM>& client_;

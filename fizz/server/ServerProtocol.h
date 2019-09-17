@@ -47,6 +47,7 @@ class ServerStateMachine {
   virtual AsyncActions processEarlyAppWrite(const State&, EarlyAppWrite);
 
   virtual Actions processAppClose(const State&);
+  virtual Actions processAppCloseImmediate(const State&);
 };
 
 namespace detail {
@@ -55,9 +56,10 @@ AsyncActions processEvent(const State& state, Param param);
 
 Actions handleError(
     const State& state,
-    const std::string& errorMsg,
+    ReportError error,
     folly::Optional<AlertDescription> alertDesc);
 
+Actions handleAppCloseImmediate(const State& state);
 Actions handleAppClose(const State& state);
 
 Actions handleInvalidEvent(const State& state, Event event, Param param);

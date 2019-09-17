@@ -8,8 +8,9 @@
 
 #pragma once
 
-#include <gmock/gmock.h>
-#include <gtest/gtest.h>
+#include <folly/io/IOBuf.h>
+#include <folly/portability/GMock.h>
+#include <folly/portability/GTest.h>
 
 namespace fizz {
 namespace test {

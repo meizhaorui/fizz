@@ -26,6 +26,8 @@ enum class StateEnum {
   ExpectingCertificateVerify,
   ExpectingFinished,
   Established,
+  ExpectingCloseNotify,
+  Closed,
   Error,
   NUM_STATES
 };
@@ -179,6 +181,14 @@ class State {
   }
 
   /**
+   * Compression algorithm used for server certificates (if any).
+   */
+  const folly::Optional<CertificateCompressionAlgorithm>& serverCertCompAlgo()
+      const {
+    return serverCertCompAlgo_;
+  }
+
+  /**
    * Certificate verifier to be used to verify server certificates on this
    * connection.
    */
@@ -288,7 +298,7 @@ class State {
   /**
    * Resumption secret.
    *
-   * Shoiuld not
+   * Should not be used outside of the state machine.
    */
   const Buf& resumptionSecret() const {
     return *resumptionSecret_;
@@ -335,6 +345,16 @@ class State {
    */
   ClientExtensions* extensions() const {
     return extensions_.get();
+  }
+
+  /**
+   * Gets the time point corresponding to when the full handshake that
+   * authenticated this connection occurred (i.e. the original full handshake
+   * for resumed connections).
+   */
+  const folly::Optional<std::chrono::system_clock::time_point>& handshakeTime()
+      const {
+    return handshakeTime_;
   }
 
   auto& state() {
@@ -433,6 +453,10 @@ class State {
     return sni_;
   }
 
+  auto& serverCertCompAlgo() {
+    return serverCertCompAlgo_;
+  }
+
   auto& clientRandom() {
     return clientRandom_;
   }
@@ -485,6 +509,10 @@ class State {
     return extensions_;
   }
 
+  auto& handshakeTime() {
+    return handshakeTime_;
+  }
+
  private:
   StateEnum state_{StateEnum::Uninitialized};
 
@@ -517,6 +545,8 @@ class State {
   folly::Optional<EarlyDataType> earlyDataType_;
   folly::Optional<std::string> alpn_;
   folly::Optional<std::string> sni_;
+  folly::Optional<CertificateCompressionAlgorithm> serverCertCompAlgo_;
+  folly::Optional<std::chrono::system_clock::time_point> handshakeTime_;
 
   folly::Optional<EarlyDataParams> earlyDataParams_;
 
@@ -538,12 +568,10 @@ class State {
   folly::Optional<Buf> exporterMasterSecret_;
   std::shared_ptr<ClientExtensions> extensions_;
 };
-} // namespace client
 
 folly::StringPiece toString(client::StateEnum);
 folly::StringPiece toString(client::ClientAuthType);
 
-namespace client {
 inline std::ostream& operator<<(std::ostream& os, StateEnum state) {
   os << toString(state);
   return os;
